@@ -1,3 +1,5 @@
+
+
 ### Current plan: 
 #### 1. use OpenCV to: 
 ####    preprocess images
@@ -13,6 +15,8 @@
 
 ### Why cant we just apply countours using OpenCV and call it a day? 
 ####    If two microplastics are close to each other or touching, countours would assume these two as one microplastic leading to inaccurate model 
+
+### This code is being designed on the LMMP dataset 
 
 ### Links: 
 #### Research: https://docs.google.com/document/d/1IidHKuvcOZBTAYJ0285bdjD_cWB6SS_9NLJEa-lFVb8/edit?usp=sharing
