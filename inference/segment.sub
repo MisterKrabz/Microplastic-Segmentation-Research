@@ -1,0 +1,27 @@
+# segment.sub
+# HTCondor Submit File for SAM2 Segmentation
+
+universe = vanilla
+executable = run_segmentation.sh
+
+# Files to Transfer IN
+transfer_input_files = \
+    segment_sam2.py, \
+    sam2_env_linux.tar.gz, \
+    sam2
+
+# Resources to Request
+request_gpus = 1
++WantGPULab = true
+
+request_cpus = 4
+request_memory = 32GB
+request_disk = 10GB
+
+# Log Files
+log = segment_job.log
+output = segment_job.out
+error = segment_job.err
+
+# submit
+queue 1

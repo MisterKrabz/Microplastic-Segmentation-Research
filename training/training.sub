@@ -1,0 +1,26 @@
+# training.sub
+universe = vanilla
+executable = run_training.sh
+
+# Files to transfer
+transfer_input_files = \
+    sam2, \
+    run_training.sh, \
+    my_train_config.yaml, \
+    osdf:///chtc/staging/pwang384/URS_Project/sam2.1_hiera_large.pt, \
+    osdf:///chtc/staging/pwang384/sam_train_env.tar.gz
+
+# Resources
+request_gpus = 1
++WantGPULab = true
+request_cpus = 8
+request_memory = 64GB
+# FIX: Increased disk to prevent "Disk usage exceeded" error later
+request_disk = 50GB 
+
+# Logging
+log = training_job.log
+output = training_job.out
+error = training_job.err
+
+queue 1
