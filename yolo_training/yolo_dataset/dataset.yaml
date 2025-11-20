@@ -1,0 +1,6 @@
+
+path: /Users/patrickwang/Workspace/URS_Project/yolo_training/yolo_dataset
+train: train/images
+val: val/images
+names:
+  0: microplastic
