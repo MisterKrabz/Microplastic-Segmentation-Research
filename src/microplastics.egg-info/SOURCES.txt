@@ -1,0 +1,9 @@
+README.md
+pyproject.toml
+src/microplastics.egg-info/PKG-INFO
+src/microplastics.egg-info/SOURCES.txt
+src/microplastics.egg-info/dependency_links.txt
+src/microplastics.egg-info/requires.txt
+src/microplastics.egg-info/top_level.txt
+src/mira/__init__.py
+src/mira/detector.py
