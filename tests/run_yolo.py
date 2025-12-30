@@ -1,36 +1,53 @@
 import os
-import sys
+import cv2
+import matplotlib.pyplot as plt
 from ultralytics import YOLO
 
-# --- CONFIGURATION ---
-IMAGE_PATH = "/Users/patrickwang/Workspace/URS_Project/datasets/dataset/LMMP/1.5umPS/0.1umPCTE/1.5umPS_0.1umPCTE+30sAu_X100_darkfield_1.jpg"
-# ---------------------
+# ==========================================
+# TESTING CONFIGURATION 
+# ==========================================
+IMAGE_PATH = "./../datasets/raw_data/LMMP/1.5umPS/1umPCTE/1_5umPS_1umPCTE_X100_darkField_1.jpg"
+MODEL_PATH = "./../models/hunter-yolo-v0.2.0.pt"
+
+# Tuning Parameters
+CONFIDENCE = 0.6   # Lower = Detect more (risk of noise). Higher = Strict.
+IOU_THRESH = 0.45   # Intersection Over Union (removes duplicate boxes)
+IMG_SIZE   = 640    # Inference size (640 is standard)
+# ==========================================
 
 def main():
-    # Resolve paths
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    project_root = os.path.dirname(script_dir)
-    model_path = os.path.join(project_root, "models", "my_model.pt")
-
-    # Validate files exist
-    if not os.path.exists(model_path):
-        sys.exit(f"Error: Model file not found at {model_path}")
-    
     if not os.path.exists(IMAGE_PATH):
-        sys.exit(f"Error: Image file not found at {IMAGE_PATH}")
+        print(f"❌ Error: Image not found at {IMAGE_PATH}")
+        return
 
-    # Load model
-    try:
-        model = YOLO(model_path)
-    except Exception as e:
-        sys.exit(f"Error loading model: {e}")
+    print(f"🔍 Running YOLO Only...")
+    print(f"⚙️  Params: Conf={CONFIDENCE} | IoU={IOU_THRESH} | Size={IMG_SIZE}")
 
-    # Run inference
-    print(f"Running inference on: {os.path.basename(IMAGE_PATH)}")
-    results = model.predict(IMAGE_PATH, save=False, conf=0.03)
+    # 1. Load Model
+    model = YOLO(MODEL_PATH)
 
-    # Display result
-    results[0].show()
+    # 2. Run Inference
+    results = model.predict(
+        source=IMAGE_PATH,
+        conf=CONFIDENCE,
+        iou=IOU_THRESH,
+        imgsz=IMG_SIZE,
+        save=False,
+        verbose=False
+    )
+
+    # 3. Visualize
+    # Ultralytics plotter returns BGR, convert to RGB for Matplotlib
+    res_plot = results[0].plot(line_width=2, font_size=1)
+    res_rgb = cv2.cvtColor(res_plot, cv2.COLOR_BGR2RGB)
+
+    plt.figure(figsize=(12, 8))
+    plt.imshow(res_rgb)
+    plt.title(f"YOLO Result | Conf: {CONFIDENCE} | Count: {len(results[0].boxes)}")
+    plt.axis('off')
+    plt.tight_layout()
+    print("Displaying result... (Close window to exit)")
+    plt.show()
 
 if __name__ == "__main__":
     main()
