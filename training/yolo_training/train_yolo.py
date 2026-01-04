@@ -1,66 +1,114 @@
-from ultralytics import YOLO
 import os
+import sys
+import glob
+import yaml 
+from ultralytics import YOLO
+
+def find_and_fix_config(root_dir="."):
+    """
+    Finds and fixes the dataset.yaml to use absolute paths.
+    Essential for CHTC execution.
+    """
+    print(f"🔎 Searching for data config in {os.path.abspath(root_dir)}...")
+    matches = glob.glob(os.path.join(root_dir, "**", "dataset.yaml"), recursive=True)
+    if not matches:
+        matches = glob.glob(os.path.join(root_dir, "**", "data.yaml"), recursive=True)
+    
+    if not matches:
+        print("CRITICAL ERROR: Could not find 'dataset.yaml' or 'data.yaml'!")
+        sys.exit(1)
+
+    yaml_path = os.path.abspath(matches[0])
+    yaml_dir = os.path.dirname(yaml_path)
+    
+    # Read the current YAML
+    with open(yaml_path, 'r') as f:
+        data = yaml.safe_load(f)
+
+    # Force the 'path' to be the directory containing the yaml
+    data['path'] = yaml_dir 
+    
+    # Write it back
+    with open(yaml_path, 'w') as f:
+        yaml.dump(data, f)
+        
+    print(f"YAML patched. New root path: {data['path']}")
+    return yaml_path
 
 def main():
-    # 1. LOAD A BETTER MODEL
-    # Switch from 'yolov8n.pt' (Nano) to 'yolov8m.pt' (Medium)
-    # The Medium model has more layers and parameters, allowing it to learn
-    # the subtle differences between the "grid" texture and the "plastic" texture.
-    # This is the single biggest factor for increasing confidence.
-    model = YOLO('yolov8m.pt')  
+    print("--- 🔍 PYTHON MICROPLASTIC TRAINING (PRECISION TUNING V2) ---")
 
-    # 2. Path to dataset
-    dataset_yaml = os.path.abspath("./yolo_dataset/dataset.yaml")
-    print(f"Training on dataset: {dataset_yaml}")
+    # Data source
+    data_config_path = find_and_fix_config("data_root")
 
-    # 3. TRAIN WITH AGGRESSIVE AUGMENTATION
+    # AUTO-RESUME LOGIC 
+    project_name = "yolo_results"
+    run_name = "microplastic_v2_precision"
+    checkpoint_path = os.path.join(project_name, run_name, "weights", "last.pt")
+
+    resume_flag = False
+
+    if os.path.exists(checkpoint_path):
+        print(f"🔄 EVICTION RECOVERY: Found checkpoint at {checkpoint_path}")
+        print("⚡ Resuming training from where it left off...")
+        model = YOLO(checkpoint_path)
+        resume_flag = True
+    else:
+        print("NO CHECKPOINT FOUND: Starting fresh training...")
+        print("Loading YOLOv11-Extra-Large (x)...")
+        model = YOLO('yolo11x.pt') 
+        resume_flag = False
+
+    print(f"Starting Training...")
+    
     results = model.train(
-        data=dataset_yaml,
+        data=data_config_path,
+        project=project_name,
+        name=run_name,
+        resume=resume_flag,
         
-        # --- Training Hyperparameters ---
-        epochs=300,          # Increased: Heavy augmentation makes learning harder but better.
-        patience=50,         # Early Stopping: Stop if no improvement for 50 epochs.
-        imgsz=1024,          # High resolution is critical for small particles.
-        device='mps',        # Apple Metal
-        batch=8,             # Reduced batch size because 'Medium' model is larger.
-        name='microplastic_hunter_v2',
+        # --- RESOURCES ---
+        epochs=300,
+        patience=50,
+        imgsz=1280,
+        batch=8,
+        device=0,
+        workers=8,
         
-        # --- THE "ZOOM" & "SECTIONS" AUGMENTATION ---
-        mosaic=1.0,          # (100%) Stitches 4 images into 1. This creates new "sections" 
-                             # and forces the model to find objects in complex contexts.
-        scale=0.8,           # (Zoom) Scales image by +/- 80%. The model will learn 
-                             # to detect tiny dots AND huge blurry blobs.
+        # --- BOUNDARY & SEPARATION LOGIC ---
+        box=12.0,
+        dfl=3.0,
+
+        # --- HALLUCINATION & OVERLAP LOGIC ---
+        iou=0.5,
+        mixup=0.0,
+        copy_paste=0.15,
+
+        # --- SENSITIVITY TUNING ---
+        hsv_h=0.015, 
+        hsv_s=0.7,   
+        hsv_v=0.4,   
+
+        # --- FALSE POSITIVE REDUCTION ---
+        close_mosaic=50,
+
+        # --- GEOMETRY ---
+        degrees=180.0,
+        translate=0.1,
+        scale=0.5,
+        shear=2.0,
+        perspective=0.0005,
+        flipud=0.5,
+        fliplr=0.5,
         
-        # --- PHYSICS-BASED AUGMENTATION ---
-        degrees=180,         # (Rotation) Microplastics have no "up" or "down". 
-                             # We allow full 180-degree random rotation.
-        fliplr=0.5,          # Flip Left-Right (50% chance)
-        flipud=0.5,          # Flip Up-Down (50% chance)
+        # --- CONTEXT ---
+        mosaic=1.0, 
         
-        # --- LIGHTING/COLOR AUGMENTATION ---
-        # Darkfield microscopy lighting varies wildly. We augment to handle this.
-        hsv_h=0.015,         # Slight Hue shift
-        hsv_s=0.7,           # High Saturation variance (some plastics are colorful, some gray)
-        hsv_v=0.4,           # High Value (Brightness) variance
-        
-        # --- ADVANCED MIXING ---
-        mixup=0.1,           # (10%) Blends two images together transparency-wise.
-                             # Helps the model ignore transparent ghosts/artifacts.
-        
-        # --- REFINEMENT ---
-        close_mosaic=20,     # Turn OFF mosaic for the last 20 epochs to 
-                             # fine-tune on realistic, un-stitched images.
+        exist_ok=True,
+        save=True,
+        val=True,
+        plots=True
     )
 
-    # 4. Validate
-    # We validate on the best model found during training
-    metrics = model.val()
-    print(f"mAP50: {metrics.box.map50}")
-    print(f"mAP50-95: {metrics.box.map}")
-
-    # 5. Export
-    path = model.export(format="onnx")
-    print(f"Model exported to {path}")
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
