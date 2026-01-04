@@ -1,0 +1,13 @@
+train: ../train/images
+val: ../valid/images
+test: ../test/images
+
+nc: 1
+names: ['Microplastics']
+
+roboflow:
+  workspace: microplastics-bcqsm
+  project: microplastics-aflu9
+  version: 6
+  license: CC BY 4.0
+  url: https://universe.roboflow.com/microplastics-bcqsm/microplastics-aflu9/dataset/6
