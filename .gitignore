@@ -1,6 +1,7 @@
-*.pt
 datasets/
-DS_Store
+.DS_Store
+**/.DS_Store
+*.pt
 __pycache__/
-.ipynb_checkpoints
+.ipynb_checkpoints/
 .vscode/
