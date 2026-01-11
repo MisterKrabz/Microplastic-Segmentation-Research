@@ -10,12 +10,15 @@ import numpy as np
 # ==========================================
 # CONFIGURATION
 # ==========================================
-SOURCE_PATH = "./../datasets/raw_data/LMMP"
-MODEL_PATH = "../models/hunter-yolo-v0.3.0.pt"
+SOURCE_PATH = "./../datasets/Microplastics-V3-ValidSplit"
+MODEL_PATH  = "../models/baseline-no_augmentations.pt"
 
-CONFIDENCE = 0.25
-IOU_THRESH = 0.5
+CONFIDENCE = 0.01
+IOU_THRESH = 0.0
 IMG_SIZE   = 1280
+
+SPLITS = ["train", "valid", "test"]
+VALID_EXTS = ('.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff')
 # ==========================================
 
 def overlay_masks_on_bgr(img_bgr, result, alpha=0.35, draw_contours=True):
@@ -64,7 +67,6 @@ def overlay_masks_on_bgr(img_bgr, result, alpha=0.35, draw_contours=True):
     # -------------------------
     # Case B: Polygon fallback
     # -------------------------
-    # Ultralytics often provides masks as polygons: masks.xy is a list of Nx2 float arrays (pixel coords)
     if hasattr(masks_obj, "xy") and masks_obj.xy is not None:
         polys = masks_obj.xy  # list of (Ni,2) arrays in pixel coords
 
@@ -75,7 +77,6 @@ def overlay_masks_on_bgr(img_bgr, result, alpha=0.35, draw_contours=True):
             color = rng.integers(0, 255, size=3, dtype=np.uint8)  # BGR
             pts = np.array(poly, dtype=np.int32).reshape((-1, 1, 2))
 
-            # Fill with transparency by drawing on an overlay
             overlay = out.copy()
             cv2.fillPoly(overlay, [pts], color=tuple(int(c) for c in color))
             out = cv2.addWeighted(overlay, alpha, out, 1 - alpha, 0)
@@ -92,20 +93,17 @@ def count_instances(result):
     """Robust instance counting for seg + detect outputs."""
     masks_obj = getattr(result, "masks", None)
     if masks_obj is not None:
-        # Prefer polygon count if present
         if hasattr(masks_obj, "xy") and masks_obj.xy is not None:
             try:
                 return len(masks_obj.xy)
             except Exception:
                 pass
-        # Else try bitmask count
         if getattr(masks_obj, "data", None) is not None and masks_obj.data is not None:
             try:
                 return int(masks_obj.data.shape[0])
             except Exception:
                 pass
 
-    # Fallback to boxes
     boxes_obj = getattr(result, "boxes", None)
     if boxes_obj is not None:
         try:
@@ -114,6 +112,59 @@ def count_instances(result):
             pass
 
     return 0
+
+
+# =========================
+# GT counting helpers
+# =========================
+def label_for_image(img_path: str) -> str:
+    """
+    Given .../<split>/images/<name>.<ext>
+    returns .../<split>/labels/<name>.txt
+    """
+    p = os.path.normpath(img_path)
+    parts = p.split(os.sep)
+    if "images" in parts:
+        idx = len(parts) - 1 - parts[::-1].index("images")
+        parts[idx] = "labels"
+    label_path = os.sep.join(parts)
+    label_path = os.path.splitext(label_path)[0] + ".txt"
+    return label_path
+
+
+def count_gt_instances(label_path: str) -> int:
+    """GT count = number of non-empty lines in the label file (each line = 1 instance)."""
+    if not os.path.exists(label_path):
+        return 0
+    n = 0
+    with open(label_path, "r", encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                n += 1
+    return n
+
+
+def pct_error(gt: int, pred: int) -> float:
+    """Percent error vs GT; returns 0 if gt=0 and pred=0, else 100 if gt=0 and pred>0."""
+    if gt == 0:
+        return 0.0 if pred == 0 else 100.0
+    return abs(pred - gt) / gt * 100.0
+
+
+def count_accuracy(gt: int, pred: int) -> float:
+    """
+    Accuracy based on count agreement:
+    - If gt == 0: accuracy = 1 if pred == 0 else 0
+    - Else: 1 - |pred-gt|/gt (clamped to [0,1])
+    """
+    if gt == 0:
+        return 1.0 if pred == 0 else 0.0
+    acc = 1.0 - (abs(pred - gt) / gt)
+    if acc < 0:
+        acc = 0.0
+    if acc > 1:
+        acc = 1.0
+    return acc
 
 
 class MicroplasticViewer:
@@ -129,11 +180,20 @@ class MicroplasticViewer:
         self.model_path = model_path
         self.progress_val = 0.0
 
+        # running totals for dataset accuracy
+        self.total_gt = 0
+        self.total_pred = 0
+        self.sum_img_acc = 0.0
+        self.n_imgs = 0
+
         self.status_frame = tk.Frame(root, pady=5)
         self.status_frame.pack(side=tk.TOP, fill=tk.X)
 
         self.lbl_status = tk.Label(self.status_frame, text="Initializing...", font=("Arial", 12, "bold"))
         self.lbl_status.pack()
+
+        self.lbl_accuracy = tk.Label(self.status_frame, text="Accuracy: --", font=("Arial", 11))
+        self.lbl_accuracy.pack()
 
         self.progress = ttk.Progressbar(self.status_frame, orient=tk.HORIZONTAL, length=400, mode='determinate')
         self.progress.pack(pady=5)
@@ -150,14 +210,21 @@ class MicroplasticViewer:
         self.btn_prev = tk.Button(self.nav_frame, text="<< Previous", command=self.show_prev, state=tk.DISABLED, width=15)
         self.btn_prev.pack(side=tk.LEFT, padx=20)
 
-        self.lbl_counter = tk.Label(self.nav_frame, text="0 / 0", font=("Arial", 10))
+        self.lbl_counter = tk.Label(self.nav_frame, text="0 / 0", font=("Arial", 10), bg="#f0f0f0")
         self.lbl_counter.pack(side=tk.LEFT, padx=20)
+
+        # ==========================================================
+        # INSERT #1 (BOTTOM BAR PER-IMAGE ACCURACY LABEL) — RIGHT HERE
+        # This shows the *current image's* accuracy as you click Next/Prev
+        # ==========================================================
+        self.lbl_img_acc = tk.Label(self.nav_frame, text="Img Acc: --", font=("Arial", 10), bg="#f0f0f0")
+        self.lbl_img_acc.pack(side=tk.LEFT, padx=20)
 
         self.btn_next = tk.Button(self.nav_frame, text="Next >>", command=self.show_next, state=tk.DISABLED, width=15)
         self.btn_next.pack(side=tk.RIGHT, padx=20)
 
         if not self.image_files:
-            self.lbl_status.config(text=f"❌ Error: No images found at {image_source}")
+            self.lbl_status.config(text=f"❌ Error: No images found under {image_source}/(train|valid|test)/images")
             return
 
         self.thread = threading.Thread(target=self.run_inference_thread, daemon=True)
@@ -165,18 +232,28 @@ class MicroplasticViewer:
 
         self.check_for_updates()
 
-    def get_image_list(self, path):
-        valid_exts = ('.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff')
+    def get_image_list(self, dataset_root):
+        """
+        ORIGINAL LOGIC preserved (walks folders), but restricted to:
+        dataset_root/train|valid|test/images/** and only image extensions.
+        """
         image_paths = []
-        if os.path.isfile(path):
-            return [path]
-        elif os.path.isdir(path):
-            for root, dirs, files in os.walk(path):
-                for file in files:
-                    if file.lower().endswith(valid_exts):
-                        image_paths.append(os.path.join(root, file))
-            return sorted(image_paths)
-        return []
+        if os.path.isfile(dataset_root):
+            if dataset_root.lower().endswith(VALID_EXTS):
+                return [dataset_root]
+            return []
+
+        if os.path.isdir(dataset_root):
+            for split in SPLITS:
+                images_dir = os.path.join(dataset_root, split, "images")
+                if not os.path.isdir(images_dir):
+                    continue
+                for root, dirs, files in os.walk(images_dir):
+                    for file in files:
+                        if file.lower().endswith(VALID_EXTS):
+                            image_paths.append(os.path.join(root, file))
+
+        return sorted(image_paths)
 
     def run_inference_thread(self):
         try:
@@ -199,24 +276,47 @@ class MicroplasticViewer:
                 iou=IOU_THRESH,
                 imgsz=IMG_SIZE,
                 verbose=False,
-                agnostic_nms=False  # helps reduce weird duplicates
+                agnostic_nms=False
             )
 
             r0 = results[0]
 
-            # draw masks robustly
             vis_bgr = overlay_masks_on_bgr(img_bgr, r0, alpha=0.35, draw_contours=True)
 
             vis_rgb = cv2.cvtColor(vis_bgr, cv2.COLOR_BGR2RGB)
             pil_img = Image.fromarray(vis_rgb)
 
-            count = count_instances(r0)
+            pred_count = count_instances(r0)
+
+            lbl_path = label_for_image(img_path)
+            gt_count = count_gt_instances(lbl_path)
+
+            err_pct = pct_error(gt_count, pred_count)
+
+            img_acc = count_accuracy(gt_count, pred_count)
+            self.total_gt += gt_count
+            self.total_pred += pred_count
+            self.sum_img_acc += img_acc
+            self.n_imgs += 1
+
             filename = os.path.basename(img_path)
+
+            split_name = "unknown"
+            norm = os.path.normpath(img_path).split(os.sep)
+            for s in SPLITS:
+                if s in norm:
+                    split_name = s
+                    break
 
             self.processed_results.append({
                 "image": pil_img,
-                "count": count,
-                "filename": filename
+                "pred_count": pred_count,
+                "gt_count": gt_count,
+                "pct_error": err_pct,
+                "filename": filename,
+                "split": split_name,
+                "label_path": lbl_path,
+                "img_acc": img_acc,
             })
 
             self.progress_val = (i + 1) / total * 100
@@ -231,6 +331,14 @@ class MicroplasticViewer:
 
         self.update_buttons()
 
+        if self.n_imgs > 0:
+            mean_acc = (self.sum_img_acc / self.n_imgs) * 100.0
+            self.lbl_accuracy.config(
+                text=f"Accuracy (mean per-image): {mean_acc:.1f}% | Total Pred/GT: {self.total_pred}/{self.total_gt}"
+            )
+        else:
+            self.lbl_accuracy.config(text="Accuracy: --")
+
         total = len(self.image_files)
         processed = len(self.processed_results)
 
@@ -242,6 +350,11 @@ class MicroplasticViewer:
             self.update_buttons()
 
     def update_display(self):
+        # ==========================================================
+        # THIS IS THE ONE PLACE YOU EDIT FOR PER-IMAGE DISPLAY.
+        # There are multiple *calls* to update_display(), but only
+        # ONE *definition* of it: right here.
+        # ==========================================================
         if not self.processed_results:
             return
 
@@ -260,7 +373,23 @@ class MicroplasticViewer:
 
         self.lbl_image.config(image=self.tk_image, text="")
         self.lbl_counter.config(text=f"Image {self.current_idx + 1} of {len(self.image_files)}")
-        self.root.title(f"Viewer - {data['filename']} | Count: {data['count']}")
+
+        pe = data["pct_error"]
+        self.root.title(
+            f"Viewer [{data['split']}] - {data['filename']} | Pred: {data['pred_count']}  GT: {data['gt_count']}  Err: {pe:.1f}%"
+        )
+
+        # ==========================================================
+        # INSERT #2 (SET BOTTOM BAR PER-IMAGE ACCURACY) — RIGHT HERE
+        # ==========================================================
+        img_acc = data.get("img_acc", None)
+        pred = data.get("pred_count", None)
+        gt = data.get("gt_count", None)
+
+        if img_acc is None or pred is None or gt is None:
+            self.lbl_img_acc.config(text="Img: Acc -- | Pred/GT --/--")
+        else:
+            self.lbl_img_acc.config(text=f"Img: Acc {img_acc * 100:.1f}% | Pred/GT {pred}/{gt}")
 
     def update_buttons(self):
         if self.current_idx > 0:
