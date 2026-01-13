@@ -10,7 +10,7 @@ import numpy as np
 # ==========================================
 # CONFIGURATION
 # ==========================================
-SOURCE_PATH = "./../datasets/Microplastics-V3-ValidSplit"
+SOURCE_PATH = "./../datasets/Microplastics-Bounding-Box"
 MODEL_PATH  = "../models/baseline-no_augmentations.pt"
 
 CONFIDENCE = 0.01
