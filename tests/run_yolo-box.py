@@ -12,7 +12,7 @@ from PIL import Image  # (already implied by Image usage, leaving minimal)
 # ==========================================
 # Can be a single file OR a folder (scanned recursively)
 SOURCE_PATH = "./../datasets/Microplastics-Bounding-Box"
-MODEL_PATH = "../models/baseline_bbox_v3.pt"
+MODEL_PATH = "../models/yolo_best_5747495.pt"
 
 # Tuning Parameters
 CONFIDENCE = 0.3
