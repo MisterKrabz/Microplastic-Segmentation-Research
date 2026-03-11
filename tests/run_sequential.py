@@ -16,8 +16,8 @@ from sam2.sam2_image_predictor import SAM2ImagePredictor
 # ==========================================
 # CONFIGURATION
 # ==========================================
-SOURCE_PATH = "./../datasets/ES-T2024_LakeMendota_v2i"
-YOLO_MODEL_PATH = "../models/yolo_best_5747495.pt"
+SOURCE_PATH = "./../datasets/ES-T2024_LakeMendota.v3i.yolov8"
+YOLO_MODEL_PATH = "../models/hunter-yolo-v0.4.3.pt"
 
 # SAM2
 SAM2_CHECKPOINT = "../models/sam2.1_hiera_large.pt"
@@ -58,7 +58,7 @@ MAX_USER_ZOOM = 12.0
 
 
 # ==========================================
-# GT counting helpers
+# GT segmentation helpers
 # ==========================================
 def label_for_image(img_path: str) -> str:
     p = os.path.normpath(img_path)
@@ -74,6 +74,123 @@ def label_for_image(img_path: str) -> str:
     return os.path.splitext(p)[0] + ".txt"
 
 
+def parse_yolo_seg_labels(label_path: str, img_w: int, img_h: int) -> list[np.ndarray]:
+    """Parse YOLO segmentation label file and return list of binary masks."""
+    masks = []
+    if not os.path.exists(label_path):
+        return masks
+    
+    with open(label_path, "r", encoding="utf-8") as f:
+        for line in f:
+            parts = line.strip().split()
+            if len(parts) < 7:  # class + at least 3 points (6 coords)
+                continue
+            
+            coords = list(map(float, parts[1:]))
+            if len(coords) % 2 != 0:
+                continue
+            
+            points = []
+            for i in range(0, len(coords), 2):
+                x = int(coords[i] * img_w)
+                y = int(coords[i + 1] * img_h)
+                points.append([x, y])
+            
+            if len(points) >= 3:
+                mask = np.zeros((img_h, img_w), dtype=np.uint8)
+                pts = np.array(points, dtype=np.int32).reshape((-1, 1, 2))
+                cv2.fillPoly(mask, [pts], 1)
+                masks.append(mask)
+    
+    return masks
+
+
+def compute_mask_iou(mask1: np.ndarray, mask2: np.ndarray) -> float:
+    """Compute IoU between two binary masks."""
+    mask1_bool = mask1.astype(bool)
+    mask2_bool = mask2.astype(bool)
+    
+    intersection = np.logical_and(mask1_bool, mask2_bool).sum()
+    union = np.logical_or(mask1_bool, mask2_bool).sum()
+    
+    if union == 0:
+        return 0.0
+    return float(intersection) / float(union)
+
+
+def match_masks_and_compute_accuracy(
+    pred_masks: list[np.ndarray],
+    gt_masks: list[np.ndarray],
+    iou_threshold: float = 0.5
+) -> tuple[float, int, int, int, list[float]]:
+    """
+    Match predicted masks to GT masks and compute accuracy metrics.
+    
+    Returns:
+        mean_iou: Average IoU of matched pairs
+        tp: True positives (matched pairs with IoU >= threshold)
+        fp: False positives (unmatched predictions)
+        fn: False negatives (unmatched GT)
+        all_ious: List of best IoU for each GT mask
+    """
+    if len(gt_masks) == 0 and len(pred_masks) == 0:
+        return 1.0, 0, 0, 0, []
+    
+    if len(gt_masks) == 0:
+        return 0.0, 0, len(pred_masks), 0, []
+    
+    if len(pred_masks) == 0:
+        return 0.0, 0, 0, len(gt_masks), [0.0] * len(gt_masks)
+    
+    iou_matrix = np.zeros((len(gt_masks), len(pred_masks)), dtype=np.float32)
+    for i, gt_mask in enumerate(gt_masks):
+        for j, pred_mask in enumerate(pred_masks):
+            pred_binary = (pred_mask > MASK_THRESH).astype(np.uint8) if pred_mask.dtype != np.uint8 else pred_mask
+            iou_matrix[i, j] = compute_mask_iou(gt_mask, pred_binary)
+    
+    matched_gt = set()
+    matched_pred = set()
+    all_ious = []
+    
+    while True:
+        if len(matched_gt) == len(gt_masks) or len(matched_pred) == len(pred_masks):
+            break
+        
+        best_iou = -1
+        best_gt_idx = -1
+        best_pred_idx = -1
+        
+        for i in range(len(gt_masks)):
+            if i in matched_gt:
+                continue
+            for j in range(len(pred_masks)):
+                if j in matched_pred:
+                    continue
+                if iou_matrix[i, j] > best_iou:
+                    best_iou = iou_matrix[i, j]
+                    best_gt_idx = i
+                    best_pred_idx = j
+        
+        if best_iou < 0:
+            break
+        
+        matched_gt.add(best_gt_idx)
+        matched_pred.add(best_pred_idx)
+        all_ious.append(best_iou)
+    
+    for i in range(len(gt_masks)):
+        if i not in matched_gt:
+            all_ious.append(0.0)
+    
+    tp = sum(1 for iou in all_ious if iou >= iou_threshold)
+    fp = len(pred_masks) - len(matched_pred)
+    fn = len(gt_masks) - tp
+    
+    mean_iou = np.mean(all_ious) if all_ious else 0.0
+    
+    return float(mean_iou), tp, fp, fn, all_ious
+
+
 def count_gt_instances(label_path: str) -> int:
     if not os.path.exists(label_path):
         return 0
@@ -83,13 +200,6 @@ def count_gt_instances(label_path: str) -> int:
             if line.strip():
                 n += 1
     return n
-
-
-def count_accuracy(gt: int, pred: int) -> float:
-    if gt == 0:
-        return 1.0 if pred == 0 else 0.0
-    acc = 1.0 - (abs(pred - gt) / gt)
-    return max(0.0, min(1.0, acc))
 
 
 # ==========================================
@@ -207,7 +317,7 @@ def draw_masks_on_top(base_bgr: np.ndarray, masks: list[np.ndarray], alpha: floa
 class NativeSAM2YOLOViewer:
     def __init__(self, root):
         self.root = root
-        self.root.title(f"YOLO (boxes+accuracy) + SAM2 (masks) | Device: {DEVICE}")
+        self.root.title(f"YOLO + SAM2 Segmentation Accuracy | Device: {DEVICE}")
         self.root.geometry("1200x900")
 
         self.image_files = self.get_image_list(SOURCE_PATH)
@@ -217,9 +327,13 @@ class NativeSAM2YOLOViewer:
         self.progress_val = 0.0
         self.show_labels = SHOW_LABELS_DEFAULT
 
+        # Segmentation accuracy metrics
         self.total_gt = 0
         self.total_pred = 0
-        self.sum_img_acc = 0.0
+        self.total_tp = 0
+        self.total_fp = 0
+        self.total_fn = 0
+        self.sum_mean_iou = 0.0
         self.n_imgs = 0
 
         self.export_dir = None
@@ -566,12 +680,9 @@ class NativeSAM2YOLOViewer:
             pred_count = len(r0.boxes)
             lbl_path = label_for_image(img_path)
             gt_count = count_gt_instances(lbl_path)
-            img_acc = count_accuracy(gt_count, pred_count)
-
-            self.total_gt += gt_count
-            self.total_pred += pred_count
-            self.sum_img_acc += img_acc
-            self.n_imgs += 1
+            
+            # Parse GT segmentation masks
+            gt_masks = parse_yolo_seg_labels(lbl_path, w, h)
 
             base_bgr_with_labels = draw_yolo_boxes_custom(
                 img_bgr, r0,
@@ -590,7 +701,7 @@ class NativeSAM2YOLOViewer:
             )
 
             boxes = r0.boxes.xyxy.cpu().numpy().astype(np.float32) if len(r0.boxes) > 0 else np.empty((0, 4), dtype=np.float32)
-            masks_for_draw = []
+            pred_masks = []
 
             if len(boxes) > 0:
                 predictor.set_image(img_rgb)
@@ -607,10 +718,24 @@ class NativeSAM2YOLOViewer:
                     m0 = m[0]
                     if m0.ndim == 3:
                         m0 = m0.squeeze(0)
-                    masks_for_draw.append(m0)
+                    pred_masks.append(m0)
 
-            final_bgr_with_labels = draw_masks_on_top(base_bgr_with_labels, masks_for_draw, alpha=MASK_ALPHA)
-            final_bgr_no_labels = draw_masks_on_top(base_bgr_no_labels, masks_for_draw, alpha=MASK_ALPHA)
+            # Compute segmentation accuracy (mask IoU)
+            mean_iou, tp, fp, fn, _ = match_masks_and_compute_accuracy(
+                pred_masks, gt_masks, iou_threshold=IOU_THRESH
+            )
+            
+            # Update totals
+            self.total_gt += gt_count
+            self.total_pred += pred_count
+            self.total_tp += tp
+            self.total_fp += fp
+            self.total_fn += fn
+            self.sum_mean_iou += mean_iou
+            self.n_imgs += 1
+
+            final_bgr_with_labels = draw_masks_on_top(base_bgr_with_labels, pred_masks, alpha=MASK_ALPHA)
+            final_bgr_no_labels = draw_masks_on_top(base_bgr_no_labels, pred_masks, alpha=MASK_ALPHA)
 
             pil_img_with_labels = Image.fromarray(cv2.cvtColor(final_bgr_with_labels, cv2.COLOR_BGR2RGB))
             pil_img_no_labels = Image.fromarray(cv2.cvtColor(final_bgr_no_labels, cv2.COLOR_BGR2RGB))
@@ -621,7 +746,10 @@ class NativeSAM2YOLOViewer:
                 "filename": os.path.basename(img_path),
                 "pred_count": pred_count,
                 "gt_count": gt_count,
-                "img_acc": img_acc,
+                "mean_iou": mean_iou,
+                "tp": tp,
+                "fp": fp,
+                "fn": fn,
                 "label_path": lbl_path,
                 "src_path": img_path,
             })
@@ -702,12 +830,14 @@ class NativeSAM2YOLOViewer:
         self.update_buttons()
 
         if self.n_imgs > 0:
-            mean_acc = (self.sum_img_acc / self.n_imgs) * 100.0
+            mean_iou = (self.sum_mean_iou / self.n_imgs) * 100.0
+            precision = self.total_tp / max(1, self.total_tp + self.total_fp) * 100.0
+            recall = self.total_tp / max(1, self.total_tp + self.total_fn) * 100.0
             self.lbl_accuracy.config(
-                text=f"Accuracy (mean per-image): {mean_acc:.1f}% | Total Pred/GT: {self.total_pred}/{self.total_gt}"
+                text=f"Mean IoU: {mean_iou:.1f}% | Precision: {precision:.1f}% | Recall: {recall:.1f}% | TP/FP/FN: {self.total_tp}/{self.total_fp}/{self.total_fn}"
             )
         else:
-            self.lbl_accuracy.config(text="Accuracy: --")
+            self.lbl_accuracy.config(text="Segmentation Accuracy: --")
 
         if len(self.processed_results) > 0 and not self.is_exporting:
             self.btn_export.config(state=tk.NORMAL)
@@ -754,15 +884,19 @@ class NativeSAM2YOLOViewer:
 
         pred = data.get("pred_count", None)
         gt = data.get("gt_count", None)
-        img_acc = data.get("img_acc", None)
+        mean_iou = data.get("mean_iou", None)
+        tp = data.get("tp", 0)
+        fp = data.get("fp", 0)
+        fn = data.get("fn", 0)
 
-        if pred is None or gt is None or img_acc is None:
-            self.lbl_img_metrics.config(text="Img: Acc -- | Pred/GT --/--")
+        if pred is None or gt is None or mean_iou is None:
+            self.lbl_img_metrics.config(text="Img: IoU -- | Pred/GT --/--")
         else:
-            self.lbl_img_metrics.config(text=f"Img: Acc {img_acc * 100:.1f}% | Pred/GT {pred}/{gt}")
+            self.lbl_img_metrics.config(text=f"Img: IoU {mean_iou * 100:.1f}% | TP/FP/FN {tp}/{fp}/{fn} | Pred/GT {pred}/{gt}")
 
+        iou_str = f"{mean_iou * 100:.1f}%" if mean_iou is not None else "--"
         self.root.title(
-            f"YOLO+SAM2 | {data['filename']} | Pred: {pred}  GT: {gt} | Labels: {'ON' if self.show_labels else 'OFF'} | Zoom: {self.user_zoom:.2f}x"
+            f"YOLO+SAM2 Seg | {data['filename']} | IoU: {iou_str} | Pred/GT: {pred}/{gt} | Labels: {'ON' if self.show_labels else 'OFF'} | Zoom: {self.user_zoom:.2f}x"
         )
 
     def update_buttons(self):
