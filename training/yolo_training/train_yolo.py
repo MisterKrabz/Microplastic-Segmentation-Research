@@ -1,114 +1,176 @@
+import glob
 import os
 import sys
-import glob
-import yaml 
-from ultralytics import YOLO
+import yaml
 
-def find_and_fix_config(root_dir="."):
-    """
-    Finds and fixes the dataset.yaml to use absolute paths.
-    Essential for CHTC execution.
-    """
-    print(f"🔎 Searching for data config in {os.path.abspath(root_dir)}...")
-    matches = glob.glob(os.path.join(root_dir, "**", "dataset.yaml"), recursive=True)
-    if not matches:
-        matches = glob.glob(os.path.join(root_dir, "**", "data.yaml"), recursive=True)
-    
-    if not matches:
-        print("CRITICAL ERROR: Could not find 'dataset.yaml' or 'data.yaml'!")
-        sys.exit(1)
 
-    yaml_path = os.path.abspath(matches[0])
-    yaml_dir = os.path.dirname(yaml_path)
+def log_epoch_stats(trainer):
+    """Callback to log metrics to a custom text file and print at the end of each epoch."""
+    epoch = trainer.epoch + 1
+    total_epochs = trainer.epochs
     
-    # Read the current YAML
-    with open(yaml_path, 'r') as f:
-        data = yaml.safe_load(f)
+    # Extract bounding box metrics (since we are back to detection)
+    metrics = trainer.metrics or {}
+    p = metrics.get('metrics/precision(B)', 0.0)
+    r = metrics.get('metrics/recall(B)', 0.0)
+    map50 = metrics.get('metrics/mAP50(B)', 0.0)
+    map50_95 = metrics.get('metrics/mAP50-95(B)', 0.0)
+    
+    # Safely extract training loss if available
+    try:
+        train_loss = getattr(trainer, 'loss', 0.0)
+        if hasattr(train_loss, 'item'):
+            train_loss = train_loss.item()
+        elif isinstance(train_loss, torch.Tensor):
+            train_loss = train_loss.sum().item()
+    except Exception:
+        train_loss = 0.0
+    
+    log_string = (
+        f"Epoch {epoch:03d}/{total_epochs:03d} | "
+        f"Train Loss: {train_loss:.4f} | "
+        f"Precision: {p:.4f} | Recall: {r:.4f} | mAP@50: {map50:.4f} | mAP@50-95: {map50_95:.4f}\n"
+    )
+    
+    # Print to standard output and flush immediately for real-time HTCondor viewing
+    print(f"[STATUS UPDATE] {log_string.strip()}")
+    sys.stdout.flush()
+    
+    # Append to a custom log file (transferred back via HTCondor)
+    with open("epoch_training_progress.log", "a") as f:
+        f.write(log_string)
 
-    # Force the 'path' to be the directory containing the yaml
-    data['path'] = yaml_dir 
+
+def rewrite_yaml_for_chtc(root_dir="data_root"):
+    root_dir = os.path.abspath(root_dir)
     
-    # Write it back
-    with open(yaml_path, 'w') as f:
-        yaml.dump(data, f)
+    # Find all yamls, use the first one as the base for class names
+    yamls = glob.glob(os.path.join(root_dir, "**", "data.yaml"), recursive=True)
+    if not yamls:
+        yamls = glob.glob(os.path.join(root_dir, "**", "dataset.yaml"), recursive=True)
+    if not yamls:
+        raise FileNotFoundError("Could not find data.yaml or dataset.yaml under data_root/")
         
-    print(f"YAML patched. New root path: {data['path']}")
-    return yaml_path
+    base_yaml = yamls[0]
+    with open(base_yaml, "r") as f:
+        data = yaml.safe_load(f) or {}
+
+    # Find ALL train/val/test image directories across all datasets
+    train_images = [os.path.abspath(p) for p in glob.glob(os.path.join(root_dir, "**", "train", "images"), recursive=True)]
+    val_images = [os.path.abspath(p) for p in glob.glob(os.path.join(root_dir, "**", "valid", "images"), recursive=True)]
+    val_images += [os.path.abspath(p) for p in glob.glob(os.path.join(root_dir, "**", "val", "images"), recursive=True)]
+    test_images = [os.path.abspath(p) for p in glob.glob(os.path.join(root_dir, "**", "test", "images"), recursive=True)]
+
+    # Deduplicate lists
+    train_images = list(dict.fromkeys(train_images))
+    val_images = list(dict.fromkeys(val_images))
+    test_images = list(dict.fromkeys(test_images))
+
+    if not train_images:
+        raise FileNotFoundError("Could not find train/images anywhere under data_root/")
+
+    if not val_images:
+        print("⚠️ No valid/ or val/ split found. Falling back to val=train.")
+        val_images = train_images
+
+    # YOLO allows lists of directories for training on multiple datasets
+    data["path"] = root_dir
+    data["train"] = train_images
+    data["val"] = val_images
+    
+    if test_images:
+        data["test"] = test_images
+    elif "test" in data:
+        del data["test"]
+
+    # Save to a new master yaml
+    master_yaml_path = os.path.join(root_dir, "master_data.yaml")
+    with open(master_yaml_path, "w") as f:
+        yaml.safe_dump(data, f, sort_keys=False)
+
+    return master_yaml_path
+
 
 def main():
-    print("--- 🔍 PYTHON MICROPLASTIC TRAINING (PRECISION TUNING V2) ---")
+    print("--- 📦 YOLO BBOX TRAINING ON CHTC ---")
 
-    # Data source
-    data_config_path = find_and_fix_config("data_root")
+    wd = os.getcwd()
+    os.environ["USER"] = "condor"
+    os.environ["LOGNAME"] = "condor"
+    os.environ["HOME"] = wd
+    os.environ["XDG_CACHE_HOME"] = os.path.join(wd, ".cache")
+    os.environ["TORCH_HOME"] = os.path.join(wd, ".cache", "torch")
+    os.environ["TORCHINDUCTOR_CACHE_DIR"] = os.path.join(wd, ".cache", "torchinductor")
+    os.environ["MPLCONFIGDIR"] = os.path.join(wd, ".cache", "matplotlib")
+    os.environ["ULTRALYTICS_SETTINGS_DIR"] = os.path.join(wd, ".ultralytics")
+    os.environ["YOLO_CONFIG_DIR"] = os.path.join(wd, ".ultralytics")
 
-    # AUTO-RESUME LOGIC 
-    project_name = "yolo_results"
-    run_name = "microplastic_v2_precision"
-    checkpoint_path = os.path.join(project_name, run_name, "weights", "last.pt")
+    for key in ["XDG_CACHE_HOME", "TORCH_HOME", "TORCHINDUCTOR_CACHE_DIR", "MPLCONFIGDIR", "ULTRALYTICS_SETTINGS_DIR"]:
+        os.makedirs(os.environ[key], exist_ok=True)
 
-    resume_flag = False
+    global torch
+    import torch
+    from ultralytics import YOLO
 
-    if os.path.exists(checkpoint_path):
-        print(f"🔄 EVICTION RECOVERY: Found checkpoint at {checkpoint_path}")
-        print("⚡ Resuming training from where it left off...")
-        model = YOLO(checkpoint_path)
-        resume_flag = True
-    else:
-        print("NO CHECKPOINT FOUND: Starting fresh training...")
-        print("Loading YOLOv11-Extra-Large (x)...")
-        model = YOLO('yolo11x.pt') 
-        resume_flag = False
+    data_config_path = rewrite_yaml_for_chtc("data_root")
+    project_dir = os.path.join(wd, "yolo_results")
+    run_name = "lake_mendota_yolo11l_bbox_combined"
+    os.makedirs(project_dir, exist_ok=True)
 
-    print(f"Starting Training...")
-    
-    results = model.train(
+    # Pure Object Detection model for your SAM2 pipeline
+    model = YOLO("yolo11l.pt")
+    model.add_callback("on_fit_epoch_end", log_epoch_stats)
+
+    workers = min(4, os.cpu_count() or 1)
+
+    model.train(
         data=data_config_path,
-        project=project_name,
+        project=project_dir,
         name=run_name,
-        resume=resume_flag,
-        
-        # --- RESOURCES ---
-        epochs=300,
-        patience=50,
+        resume=False,
+
+        epochs=2000,
+        patience=200,
         imgsz=1280,
-        batch=8,
+        batch=8,          # Try changing this to 8 later if your GPU memory allows!
         device=0,
-        workers=8,
-        
-        # --- BOUNDARY & SEPARATION LOGIC ---
-        box=12.0,
-        dfl=3.0,
+        workers=workers,
 
-        # --- HALLUCINATION & OVERLAP LOGIC ---
-        iou=0.5,
-        mixup=0.0,
-        copy_paste=0.15,
+        optimizer="AdamW",
+        lr0=0.0015,
+        lrf=0.01,
+        cos_lr=True,
+        weight_decay=0.01,
+        warmup_epochs=5.0,
 
-        # --- SENSITIVITY TUNING ---
-        hsv_h=0.015, 
-        hsv_s=0.7,   
-        hsv_v=0.4,   
+        # Microscopy-Safe Augmentations for Blob Detection
+        mosaic=0.0,       # OFF: Preserves slide context and relative sizes
+        mixup=0.05,
+        copy_paste=0.0,   # OFF: Irrelevant for bbox models
 
-        # --- FALSE POSITIVE REDUCTION ---
-        close_mosaic=50,
-
-        # --- GEOMETRY ---
-        degrees=180.0,
-        translate=0.1,
-        scale=0.5,
-        shear=2.0,
-        perspective=0.0005,
+        degrees=360.0,    # Safe: Microscopy samples have no up/down
+        scale=0.25,        # Slight variance helps it recognize large blobs
+        translate=0.1,    # Shifts image so blobs aren't always centered
+        shear=0.0,
+        perspective=0.0,
         flipud=0.5,
         fliplr=0.5,
-        
-        # --- CONTEXT ---
-        mosaic=1.0, 
-        
-        exist_ok=True,
-        save=True,
+	overlap_mask=True,
+
+        hsv_h=0.0,        # OFF: Color sensitive data
+        hsv_s=0.0,        # OFF: Color sensitive data
+        hsv_v=0.0,        # OFF: Color sensitive data
+
+        amp=True,
         val=True,
-        plots=True
+        save=True,
+        plots=True,
+        exist_ok=True,
     )
 
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        print(f"❌ train_yolo.py failed: {e}", file=sys.stderr)
+        raise
