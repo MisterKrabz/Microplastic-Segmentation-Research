@@ -16,15 +16,16 @@ from sam2.sam2_image_predictor import SAM2ImagePredictor
 # ==========================================
 # CONFIGURATION
 # ==========================================
-SOURCE_PATH = "./../datasets/ES-T2024_LakeMendota.v3i.yolov8"
-YOLO_MODEL_PATH = "../models/hunter-yolo-v0.4.3.pt"
+# Comma-separated list of folder paths containing images
+SOURCE_PATHS = "./../datasets/ES-T2024_LakeMendota.v3i.yolov8,./../datasets/Microplastics-V3-ValidSplit"
+YOLO_MODEL_PATH = "../models/hunter-yolo-v0.4.4.pt"
 
 # SAM2
 SAM2_CHECKPOINT = "../models/sam2.1_hiera_large.pt"
 SAM2_CONFIG_NAME = "configs/sam2.1/sam2.1_hiera_l.yaml"
 
 # YOLO inference
-CONFIDENCE = 0.3
+CONFIDENCE = 0.2
 IOU_THRESH = 0.25
 IMG_SIZE = 1280
 
@@ -32,7 +33,6 @@ IMG_SIZE = 1280
 BOX_LINE_WIDTH = 1
 LABEL_FONT_SCALE = 0.30
 LABEL_FONT_THICKNESS = 1
-SHOW_LABELS_DEFAULT = False
 SHOW_CLASS_NAME = False  # False = show only confidence
 
 DEVICE = (
@@ -320,12 +320,12 @@ class NativeSAM2YOLOViewer:
         self.root.title(f"YOLO + SAM2 Segmentation Accuracy | Device: {DEVICE}")
         self.root.geometry("1200x900")
 
-        self.image_files = self.get_image_list(SOURCE_PATH)
+        self.image_files = self.get_image_list(SOURCE_PATHS)
         self.processed_results = []
         self.current_idx = 0
         self.is_processing = True
         self.progress_val = 0.0
-        self.show_labels = SHOW_LABELS_DEFAULT
+        self.show_overlays = True
 
         # Segmentation accuracy metrics
         self.total_gt = 0
@@ -356,7 +356,7 @@ class NativeSAM2YOLOViewer:
         self.bind_navigation_events()
 
         if not self.image_files:
-            self.lbl_status.config(text=f"❌ Error: No images found at {SOURCE_PATH}")
+            self.lbl_status.config(text=f"❌ Error: No images found at {SOURCE_PATHS}")
             self.is_processing = False
             return
 
@@ -425,13 +425,13 @@ class NativeSAM2YOLOViewer:
         )
         self.btn_export.pack(side=tk.RIGHT, padx=10)
 
-        self.btn_toggle_labels = tk.Button(
+        self.btn_toggle_overlays = tk.Button(
             frame_bot,
-            text="Show Labels" if not self.show_labels else "Hide Labels",
-            command=self.toggle_labels,
+            text="Toggle Overlays",
+            command=self.toggle_overlays,
             width=14
         )
-        self.btn_toggle_labels.pack(side=tk.RIGHT, padx=10)
+        self.btn_toggle_overlays.pack(side=tk.RIGHT, padx=10)
 
     def bind_navigation_events(self):
         self.root.bind("<Configure>", self.on_window_resize)
@@ -469,19 +469,22 @@ class NativeSAM2YOLOViewer:
     # -------------------------
     # Dataset scanning
     # -------------------------
-    def get_image_list(self, dataset_root):
+    def get_image_list(self, source_paths_str):
         image_paths = []
+        
+        paths = [p.strip() for p in source_paths_str.split(",") if p.strip()]
+        
+        for dataset_root in paths:
+            if os.path.isfile(dataset_root):
+                if dataset_root.lower().endswith(VALID_EXTS):
+                    image_paths.append(dataset_root)
+                continue
 
-        if os.path.isfile(dataset_root):
-            if dataset_root.lower().endswith(VALID_EXTS):
-                return [dataset_root]
-            return []
-
-        if os.path.isdir(dataset_root):
-            for r, _, files in os.walk(dataset_root):
-                for f in files:
-                    if f.lower().endswith(VALID_EXTS):
-                        image_paths.append(os.path.join(r, f))
+            if os.path.isdir(dataset_root):
+                for r, _, files in os.walk(dataset_root):
+                    for f in files:
+                        if f.lower().endswith(VALID_EXTS):
+                            image_paths.append(os.path.join(r, f))
 
         return sorted(image_paths)
 
@@ -492,7 +495,7 @@ class NativeSAM2YOLOViewer:
         if not self.processed_results:
             return None
         data = self.processed_results[self.current_idx]
-        key = "image_with_labels" if self.show_labels else "image_no_labels"
+        key = "image_with_overlays" if self.show_overlays else "image_original"
         return data[key]
 
     def reset_view(self):
@@ -644,15 +647,15 @@ class NativeSAM2YOLOViewer:
     # -------------------------
     def run_pipeline(self):
         try:
-            print(f"🔹 Loading YOLO: {YOLO_MODEL_PATH}")
+            print(f"Loading YOLO: {YOLO_MODEL_PATH}")
             yolo = YOLO(YOLO_MODEL_PATH)
 
-            print(f"🔹 Loading Native SAM2: {SAM2_CHECKPOINT}")
+            print(f"Loading Native SAM2: {SAM2_CHECKPOINT}")
             sam2_model = build_sam2(SAM2_CONFIG_NAME, SAM2_CHECKPOINT, device=DEVICE)
             predictor = SAM2ImagePredictor(sam2_model)
 
         except Exception as e:
-            print(f"❌ MODEL LOAD ERROR: {e}")
+            print(f"MODEL LOAD ERROR: {e}")
             self.lbl_status.config(text=f"Error: {e}")
             self.is_processing = False
             return
@@ -684,17 +687,9 @@ class NativeSAM2YOLOViewer:
             # Parse GT segmentation masks
             gt_masks = parse_yolo_seg_labels(lbl_path, w, h)
 
-            base_bgr_with_labels = draw_yolo_boxes_custom(
+            base_bgr_with_boxes = draw_yolo_boxes_custom(
                 img_bgr, r0,
                 show_labels=True,
-                line_width=BOX_LINE_WIDTH,
-                font_scale=LABEL_FONT_SCALE,
-                font_thickness=LABEL_FONT_THICKNESS,
-            )
-
-            base_bgr_no_labels = draw_yolo_boxes_custom(
-                img_bgr, r0,
-                show_labels=False,
                 line_width=BOX_LINE_WIDTH,
                 font_scale=LABEL_FONT_SCALE,
                 font_thickness=LABEL_FONT_THICKNESS,
@@ -734,15 +729,14 @@ class NativeSAM2YOLOViewer:
             self.sum_mean_iou += mean_iou
             self.n_imgs += 1
 
-            final_bgr_with_labels = draw_masks_on_top(base_bgr_with_labels, pred_masks, alpha=MASK_ALPHA)
-            final_bgr_no_labels = draw_masks_on_top(base_bgr_no_labels, pred_masks, alpha=MASK_ALPHA)
+            final_bgr_with_overlays = draw_masks_on_top(base_bgr_with_boxes, pred_masks, alpha=MASK_ALPHA)
 
-            pil_img_with_labels = Image.fromarray(cv2.cvtColor(final_bgr_with_labels, cv2.COLOR_BGR2RGB))
-            pil_img_no_labels = Image.fromarray(cv2.cvtColor(final_bgr_no_labels, cv2.COLOR_BGR2RGB))
+            pil_img_with_overlays = Image.fromarray(cv2.cvtColor(final_bgr_with_overlays, cv2.COLOR_BGR2RGB))
+            pil_img_original = Image.fromarray(img_rgb)
 
             self.processed_results.append({
-                "image_with_labels": pil_img_with_labels,
-                "image_no_labels": pil_img_no_labels,
+                "image_with_overlays": pil_img_with_overlays,
+                "image_original": pil_img_original,
                 "filename": os.path.basename(img_path),
                 "pred_count": pred_count,
                 "gt_count": gt_count,
@@ -763,7 +757,8 @@ class NativeSAM2YOLOViewer:
     # -------------------------
     def make_export_dir(self) -> str:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        export_root = os.path.join(SOURCE_PATH, EXPORT_ROOT_NAME)
+        first_path = SOURCE_PATHS.split(",")[0].strip()
+        export_root = os.path.join(first_path, EXPORT_ROOT_NAME)
         os.makedirs(export_root, exist_ok=True)
 
         export_dir = os.path.join(export_root, f"{EXPORT_PREFIX}_{ts}")
@@ -791,14 +786,14 @@ class NativeSAM2YOLOViewer:
 
     def _export_worker(self):
         results_snapshot = list(self.processed_results)
-        img_key = "image_with_labels" if self.show_labels else "image_no_labels"
+        img_key = "image_with_overlays" if self.show_overlays else "image_original"
 
         for idx, item in enumerate(results_snapshot, start=1):
             img: Image.Image = item[img_key]
             src_path = item.get("src_path", "")
             base = os.path.splitext(os.path.basename(src_path))[0] if src_path else os.path.splitext(item["filename"])[0]
 
-            suffix = "_with_labels" if self.show_labels else "_no_labels"
+            suffix = "_with_overlays" if self.show_overlays else "_original"
             out_name = f"{base}_yolo_sam2{suffix}.png"
             out_path = os.path.join(self.export_dir, out_name)
 
@@ -847,7 +842,7 @@ class NativeSAM2YOLOViewer:
             self.lbl_status.config(text=f"⚙️ Processing: {done}/{len(self.image_files)} images ready...")
             self.root.after(100, self.check_updates)
         else:
-            self.lbl_status.config(text=f"✅ Done! Processed {len(self.processed_results)} images.")
+            self.lbl_status.config(text=f"Processed {len(self.processed_results)} images.")
             self.update_buttons()
             if len(self.processed_results) > 0 and not self.is_exporting:
                 self.btn_export.config(state=tk.NORMAL)
@@ -896,7 +891,7 @@ class NativeSAM2YOLOViewer:
 
         iou_str = f"{mean_iou * 100:.1f}%" if mean_iou is not None else "--"
         self.root.title(
-            f"YOLO+SAM2 Seg | {data['filename']} | IoU: {iou_str} | Pred/GT: {pred}/{gt} | Labels: {'ON' if self.show_labels else 'OFF'} | Zoom: {self.user_zoom:.2f}x"
+            f"YOLO+SAM2 Seg | {data['filename']} | IoU: {iou_str} | Pred/GT: {pred}/{gt} | Overlays: {'ON' if self.show_overlays else 'OFF'} | Zoom: {self.user_zoom:.2f}x"
         )
 
     def update_buttons(self):
@@ -905,11 +900,8 @@ class NativeSAM2YOLOViewer:
         self.btn_prev.config(state=state_prev)
         self.btn_next.config(state=state_next)
 
-    def toggle_labels(self):
-        self.show_labels = not self.show_labels
-        self.btn_toggle_labels.config(
-            text="Hide Labels" if self.show_labels else "Show Labels"
-        )
+    def toggle_overlays(self):
+        self.show_overlays = not self.show_overlays
         self.update_display()
 
     def next_img(self):
