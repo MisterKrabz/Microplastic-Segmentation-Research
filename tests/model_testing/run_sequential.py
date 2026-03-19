@@ -17,15 +17,15 @@ from sam2.sam2_image_predictor import SAM2ImagePredictor
 # CONFIGURATION
 # ==========================================
 # Comma-separated list of folder paths containing images
-SOURCE_PATHS = "./../datasets/ES-T2024_LakeMendota.v3i.yolov8,./../datasets/Microplastics-V3-ValidSplit"
-YOLO_MODEL_PATH = "../models/hunter-yolo-v0.4.4.pt"
+SOURCE_PATHS = "./../../datasets/ES-T2024_LakeMendota.v3i.yolov8,./../../datasets/Microplastics-V3-ValidSplit"
+YOLO_MODEL_PATH = "./../../models/hunter-yolo-v0.4.4.pt"
 
 # SAM2
-SAM2_CHECKPOINT = "../models/sam2.1_hiera_large.pt"
+SAM2_CHECKPOINT = "./../../models/sam2.1_hiera_large.pt"
 SAM2_CONFIG_NAME = "configs/sam2.1/sam2.1_hiera_l.yaml"
 
 # YOLO inference
-CONFIDENCE = 0.2
+CONFIDENCE = 0.1
 IOU_THRESH = 0.25
 IMG_SIZE = 1280
 

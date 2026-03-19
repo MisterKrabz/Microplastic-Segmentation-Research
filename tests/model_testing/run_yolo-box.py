@@ -188,14 +188,14 @@ class MicroplasticViewer:
             # Pred count (UNCHANGED logic)
             pred_count = len(results[0].boxes)
 
-            # NEW: GT count from label
+            # GT count from label
             lbl_path = label_for_image(img_path)
             gt_count = count_gt_instances(lbl_path)
 
-            # NEW: per-image accuracy
+            # per-image accuracy
             img_acc = count_accuracy(gt_count, pred_count)
 
-            # NEW: update running totals
+            # update running totals
             self.total_gt += gt_count
             self.total_pred += pred_count
             self.sum_img_acc += img_acc

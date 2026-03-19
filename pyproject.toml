@@ -3,20 +3,42 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "microplastics"
+name = "mira-microplastics"
 version = "0.1.0"
-description = "Microplastic Segmentation Framework using YOLO + SAM 2"
+description = "MIRA – Microplastic Intelligent Recognition Architecture: detection and segmentation using YOLO + SAM 2"
+readme = "README.md"
+license = {text = "MIT"}
 requires-python = ">=3.10"
+keywords = ["microplastics", "detection", "segmentation", "yolo", "sam2", "computer-vision"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Image Recognition",
+]
 dependencies = [
     "numpy>=1.26.0",
-    "matplotlib>=3.10.0",
     "opencv-python>=4.10.0",
     "torch>=2.4.0",
     "ultralytics>=8.3.0",
-    "huggingface_hub>=0.20.0",
-    "sam2>=1.1.0"
+    "sam2>=1.1.0",
 ]
 
-# only build the framework on PYPI using the code in src 
+[project.optional-dependencies]
+viewer = ["Pillow>=10.0.0"]
+dev = [
+    "pytest>=7.0",
+    "build>=1.0",
+    "twine>=5.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/patrickwang/mira-microplastics"
+Repository = "https://github.com/patrickwang/mira-microplastics"
+
 [tool.setuptools.packages.find]
 where = ["src"]
