@@ -5,10 +5,8 @@ Runs YOLO + SAM2 on images that have a paired CNN-predicted chemical map CSV.
 For each segmented microplastic, the app looks up which grid cells the mask
 overlaps and determines the material via majority vote.
 
-Expected folder structure:
-    <base>__NN_modified.jpg                            (image to analyse)
-    <base>__NN_Raw_predictedMap_cnn_aug.csv            (grid chemical map)
-    <base>__NN_Raw_aug_cnn_predicted_*_2nd.png         (visualisation, optional)
+Toggle controls for YOLO boxes, SAM2 masks, and labels independently.
+Hovering over a detection reveals its hidden elements even when toggled off.
 """
 
 import os
@@ -50,8 +48,6 @@ DEVICE = (
     else "cpu"
 )
 
-VALID_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff")
-
 BOX_SHRINK = 0.10
 MASK_THRESH = 0.5
 MASK_ALPHA = 0.45
@@ -67,89 +63,52 @@ MATERIAL_COLORS = {
     "Cotton":                   (80, 200, 80),
     "NA":                       (128, 128, 128),
 }
-
 DEFAULT_COLOR = (200, 200, 200)
 
 
 # ==========================================
-# Chemical map helpers
+# Helpers
 # ==========================================
 def load_chemical_map(csv_path: str) -> list[list[str]]:
-    """Load a predicted chemical map CSV into a 2-D grid of material strings."""
     with open(csv_path, "r", encoding="utf-8") as f:
         reader = csv.reader(f)
-        header = next(reader)
-        grid = []
-        for row in reader:
-            grid.append(row)
-    return grid
+        next(reader)
+        return [row for row in reader]
 
 
-def classify_mask(
-    mask: np.ndarray,
-    chem_grid: list[list[str]],
-    img_h: int,
-    img_w: int,
-) -> tuple[str, dict[str, int]]:
-    """
-    Given a binary mask and a chemical-map grid, determine the material
-    of the segmented object by majority vote of the non-NA grid cells
-    the mask overlaps.
-
-    Returns (winner_material, vote_counts).
-    """
+def classify_mask(mask, chem_grid, img_h, img_w):
     n_rows = len(chem_grid)
-    n_cols = len(chem_grid[0]) if n_rows > 0 else 0
+    n_cols = len(chem_grid[0]) if n_rows else 0
     if n_rows == 0 or n_cols == 0:
         return "Unknown", {}
-
-    cell_h = img_h / n_rows
-    cell_w = img_w / n_cols
-
+    cell_h, cell_w = img_h / n_rows, img_w / n_cols
     mask_bin = (mask > MASK_THRESH).astype(np.uint8) if mask.dtype != np.uint8 else mask
     ys, xs = np.where(mask_bin > 0)
-
     if len(ys) == 0:
         return "Unknown", {}
-
     grid_rows = np.clip((ys / cell_h).astype(int), 0, n_rows - 1)
     grid_cols = np.clip((xs / cell_w).astype(int), 0, n_cols - 1)
-
-    cell_indices = set(zip(grid_rows.tolist(), grid_cols.tolist()))
-
+    cells = set(zip(grid_rows.tolist(), grid_cols.tolist()))
     votes: Counter = Counter()
-    for r, c in cell_indices:
-        material = chem_grid[r][c].strip() if c < len(chem_grid[r]) else "NA"
-        if material and material != "NA":
-            votes[material] += 1
-
+    for r, c in cells:
+        mat = chem_grid[r][c].strip() if c < len(chem_grid[r]) else "NA"
+        if mat and mat != "NA":
+            votes[mat] += 1
     if not votes:
-        return "NA", {"NA": len(cell_indices)}
-
-    winner = votes.most_common(1)[0][0]
-    return winner, dict(votes)
+        return "NA", {"NA": len(cells)}
+    return votes.most_common(1)[0][0], dict(votes)
 
 
-def color_for_material(material: str) -> tuple[int, int, int]:
+def color_for_material(material):
     for key, color in MATERIAL_COLORS.items():
         if key.lower() in material.lower():
             return color
     return DEFAULT_COLOR
 
 
-# ==========================================
-# Dataset pairing
-# ==========================================
-def find_image_csv_pairs(dataset_dir: str) -> list[dict]:
-    """
-    Scan a directory and pair each *_modified.jpg with its
-    *_Raw_predictedMap_cnn_aug.csv by matching the __NN index.
-    """
+def find_image_csv_pairs(dataset_dir):
     files = os.listdir(dataset_dir)
-
-    images = {}
-    csvs = {}
-
+    images, csvs = {}, {}
     for f in files:
         full = os.path.join(dataset_dir, f)
         if f.endswith("_modified.jpg") or f.endswith("_modified.png"):
@@ -160,21 +119,13 @@ def find_image_csv_pairs(dataset_dir: str) -> list[dict]:
             m = re.search(r"__(\d+)_Raw_predictedMap", f)
             if m:
                 csvs[m.group(1)] = full
-
     pairs = []
-    for idx in sorted(images.keys()):
+    for idx in sorted(images):
         if idx in csvs:
-            pairs.append({
-                "image_path": images[idx],
-                "csv_path": csvs[idx],
-                "index": idx,
-            })
+            pairs.append({"image_path": images[idx], "csv_path": csvs[idx], "index": idx})
     return pairs
 
 
-# ==========================================
-# Drawing helpers
-# ==========================================
 def shrink_box(box_xyxy, w, h, frac):
     if frac <= 0:
         return box_xyxy
@@ -192,25 +143,35 @@ def shrink_box(box_xyxy, w, h, frac):
     return np.array([x1n, y1n, x2n, y2n], dtype=np.float32)
 
 
-def draw_material_overlays(
+# ==========================================
+# Compositing
+# ==========================================
+def compose_image(
     image_bgr: np.ndarray,
     masks: list[np.ndarray],
     materials: list[str],
     boxes_xyxy: np.ndarray,
     confidences: np.ndarray,
+    *,
+    show_yolo: bool = True,
+    show_sam2: bool = True,
+    show_labels: bool = True,
+    hover_idx: int = -1,
     alpha: float = MASK_ALPHA,
 ) -> np.ndarray:
-    """Draw color-coded masks and material labels on the image."""
+    """Compose the display image based on toggle states and hover."""
     out = image_bgr.copy()
     overlay = image_bgr.copy()
 
     for i, (mask, material) in enumerate(zip(masks, materials)):
         if mask is None:
             continue
+        visible = show_sam2 or i == hover_idx
+        if not visible:
+            continue
         mask_bin = (mask > MASK_THRESH).astype(np.uint8) * 255
         if mask_bin.sum() == 0:
             continue
-
         color = color_for_material(material)
         contours, _ = cv2.findContours(mask_bin, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         cv2.drawContours(overlay, contours, -1, color, -1)
@@ -218,35 +179,34 @@ def draw_material_overlays(
 
     out = cv2.addWeighted(overlay, alpha, out, 1 - alpha, 0)
 
-    for i, material in enumerate(materials):
-        if i >= len(boxes_xyxy):
-            continue
-        x1, y1, x2, y2 = boxes_xyxy[i].astype(int)
+    for i in range(min(len(materials), len(boxes_xyxy))):
+        material = materials[i]
         color = color_for_material(material)
+        x1, y1, x2, y2 = boxes_xyxy[i].astype(int)
         conf = confidences[i] if i < len(confidences) else 0.0
 
-        cv2.rectangle(out, (x1, y1), (x2, y2), color, BOX_LINE_WIDTH)
+        if show_yolo or i == hover_idx:
+            cv2.rectangle(out, (x1, y1), (x2, y2), color, BOX_LINE_WIDTH)
 
-        label = f"{material} ({conf:.0%})"
-        (tw, th), baseline = cv2.getTextSize(
-            label, cv2.FONT_HERSHEY_SIMPLEX, LABEL_FONT_SCALE, LABEL_FONT_THICKNESS
-        )
-
-        bg_top = y1 - th - baseline - 10
-        bg_bottom = y1
-        if bg_top < 0:
-            bg_top = y2
-            bg_bottom = y2 + th + baseline + 10
-            text_y = y2 + th + 4
-        else:
-            text_y = y1 - 6
-
-        cv2.rectangle(out, (x1, bg_top), (x1 + tw + 10, bg_bottom), color, -1)
-        cv2.putText(
-            out, label, (x1 + 4, text_y),
-            cv2.FONT_HERSHEY_SIMPLEX, LABEL_FONT_SCALE,
-            (255, 255, 255), LABEL_FONT_THICKNESS, cv2.LINE_AA,
-        )
+        if show_labels or i == hover_idx:
+            label = f"{material} ({conf:.0%})"
+            (tw, th), baseline = cv2.getTextSize(
+                label, cv2.FONT_HERSHEY_SIMPLEX, LABEL_FONT_SCALE, LABEL_FONT_THICKNESS
+            )
+            bg_top = y1 - th - baseline - 10
+            bg_bottom = y1
+            if bg_top < 0:
+                bg_top = y2
+                bg_bottom = y2 + th + baseline + 10
+                text_y = y2 + th + 4
+            else:
+                text_y = y1 - 6
+            cv2.rectangle(out, (x1, bg_top), (x1 + tw + 10, bg_bottom), color, -1)
+            cv2.putText(
+                out, label, (x1 + 4, text_y),
+                cv2.FONT_HERSHEY_SIMPLEX, LABEL_FONT_SCALE,
+                (255, 255, 255), LABEL_FONT_THICKNESS, cv2.LINE_AA,
+            )
 
     return out
 
@@ -265,7 +225,12 @@ class ChemicalIdentificationViewer:
         self.current_idx = 0
         self.is_processing = True
         self.progress_val = 0.0
-        self.show_overlays = True
+
+        self.show_yolo = True
+        self.show_sam2 = True
+        self.show_labels = True
+        self.hover_idx = -1
+
         self.is_exporting = False
         self._export_done = False
         self._export_progress = (0, 1)
@@ -278,6 +243,10 @@ class ChemicalIdentificationViewer:
         self.pan_y = 0.0
         self._drag_last_x = None
         self._drag_last_y = None
+        self._is_dragging = False
+
+        self._cache_key = None
+        self._cached_pil = None
 
         self.setup_gui()
         self.bind_events()
@@ -292,7 +261,7 @@ class ChemicalIdentificationViewer:
         self.check_updates()
 
     # -----------------------------------------------
-    # GUI setup
+    # GUI
     # -----------------------------------------------
     def setup_gui(self):
         frame_top = tk.Frame(self.root, pady=5)
@@ -307,40 +276,52 @@ class ChemicalIdentificationViewer:
         self.progress = ttk.Progressbar(frame_top, orient=tk.HORIZONTAL, length=500, mode="determinate")
         self.progress.pack(pady=5)
 
+        self.lbl_img_info = tk.Label(frame_top, text="", font=("Arial", 9), wraplength=800)
+        self.lbl_img_info.pack()
+
+        self.lbl_export = tk.Label(frame_top, text="", font=("Arial", 9))
+        self.lbl_export.pack()
+
         self.canvas = tk.Canvas(self.root, bg="#1a1a1a", highlightthickness=0)
         self.canvas.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
         frame_bot = tk.Frame(self.root, pady=12, bg="#f0f0f0")
         frame_bot.pack(side=tk.BOTTOM, fill=tk.X)
 
-        self.lbl_img_info = tk.Label(frame_top, text="", font=("Arial", 9), wraplength=800)
-        self.lbl_img_info.pack()
-
-        self.btn_prev = tk.Button(frame_bot, text="<< Prev", command=self.prev_img, state=tk.DISABLED, width=12)
-        self.btn_prev.pack(side=tk.LEFT, padx=10)
+        self.btn_prev = tk.Button(frame_bot, text="<< Prev", command=self.prev_img, state=tk.DISABLED, width=10)
+        self.btn_prev.pack(side=tk.LEFT, padx=6)
 
         self.lbl_counter = tk.Label(frame_bot, text="0 / 0", font=("Arial", 10), bg="#f0f0f0")
-        self.lbl_counter.pack(side=tk.LEFT, padx=10)
+        self.lbl_counter.pack(side=tk.LEFT, padx=6)
 
-        self.btn_toggle = tk.Button(
-            frame_bot, text="Hide Overlays", command=self.toggle_overlays, width=14
-        )
-        self.btn_toggle.pack(side=tk.LEFT, padx=10)
+        self.btn_yolo = tk.Button(frame_bot, text="Toggle YOLO", command=self.toggle_yolo, width=12)
+        self.btn_yolo.pack(side=tk.LEFT, padx=4)
 
-        self.btn_next = tk.Button(frame_bot, text="Next >>", command=self.next_img, state=tk.DISABLED, width=12)
-        self.btn_next.pack(side=tk.RIGHT, padx=10)
+        self.btn_sam2 = tk.Button(frame_bot, text="Toggle SAM2", command=self.toggle_sam2, width=12)
+        self.btn_sam2.pack(side=tk.LEFT, padx=4)
 
-        self.btn_export = tk.Button(frame_bot, text="Export All", command=self.export_all, state=tk.DISABLED, width=12)
-        self.btn_export.pack(side=tk.RIGHT, padx=10)
+        self.btn_labels = tk.Button(frame_bot, text="Toggle Labels", command=self.toggle_labels, width=12)
+        self.btn_labels.pack(side=tk.LEFT, padx=4)
 
-        self.lbl_export = tk.Label(frame_top, text="", font=("Arial", 9))
-        self.lbl_export.pack()
+        self.btn_next = tk.Button(frame_bot, text="Next >>", command=self.next_img, state=tk.DISABLED, width=10)
+        self.btn_next.pack(side=tk.RIGHT, padx=6)
+
+        self.btn_export = tk.Button(frame_bot, text="Export All", command=self.export_all, state=tk.DISABLED, width=10)
+        self.btn_export.pack(side=tk.RIGHT, padx=6)
+
+        self.lbl_hover = tk.Label(frame_bot, text="", font=("Arial", 9), bg="#f0f0f0", anchor="w")
+        self.lbl_hover.pack(side=tk.LEFT, padx=6, fill=tk.X, expand=True)
+
+    def _update_toggle_btn(self, btn, label, state):
+        btn.config(text=f"Toggle {label}")
 
     def bind_events(self):
         self.root.bind("<Configure>", self.on_resize)
         self.canvas.bind("<ButtonPress-1>", self.on_drag_start)
         self.canvas.bind("<B1-Motion>", self.on_drag_move)
         self.canvas.bind("<ButtonRelease-1>", self.on_drag_end)
+        self.canvas.bind("<Motion>", self.on_mouse_move)
+        self.canvas.bind("<Leave>", self.on_mouse_leave)
         self.canvas.bind("<MouseWheel>", self.on_mousewheel)
         self.root.bind_all("<MouseWheel>", self.on_mousewheel)
         self.canvas.bind("<Button-4>", self.on_mousewheel_linux)
@@ -355,18 +336,118 @@ class ChemicalIdentificationViewer:
         self.root.bind("<Command-0>", self.reset_zoom_key)
 
     # -----------------------------------------------
-    # Viewport
+    # Compositing
     # -----------------------------------------------
+    def _cache_compose_key(self):
+        return (self.current_idx, self.show_yolo, self.show_sam2, self.show_labels, self.hover_idx)
+
     def get_current_pil_image(self):
         if not self.processed_results:
             return None
-        data = self.processed_results[self.current_idx]
-        return data["image_overlay"] if self.show_overlays else data["image_original"]
 
+        key = self._cache_compose_key()
+        if self._cache_key == key and self._cached_pil is not None:
+            return self._cached_pil
+
+        data = self.processed_results[self.current_idx]
+        bgr = compose_image(
+            data["image_bgr"],
+            data["masks"],
+            data["materials"],
+            data["boxes_xyxy"],
+            data["confidences"],
+            show_yolo=self.show_yolo,
+            show_sam2=self.show_sam2,
+            show_labels=self.show_labels,
+            hover_idx=self.hover_idx,
+        )
+        pil = Image.fromarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
+        self._cache_key = key
+        self._cached_pil = pil
+        return pil
+
+    def invalidate_cache(self):
+        self._cache_key = None
+        self._cached_pil = None
+
+    # -----------------------------------------------
+    # Hover detection
+    # -----------------------------------------------
+    def _canvas_to_image_coords(self, cx, cy):
+        """Convert canvas pixel coords to original image pixel coords."""
+        if not self.processed_results:
+            return -1, -1
+        data = self.processed_results[self.current_idx]
+        ih, iw = data["image_bgr"].shape[:2]
+        cw = max(1, self.canvas.winfo_width())
+        ch = max(1, self.canvas.winfo_height())
+        scale = self.effective_scale(iw, ih, cw, ch)
+        if scale <= 0:
+            return -1, -1
+        img_x = (cx - self.pan_x) / scale
+        img_y = (cy - self.pan_y) / scale
+        return int(img_x), int(img_y)
+
+    def _hit_test(self, img_x, img_y):
+        """Return the index of the detection under (img_x, img_y), or -1."""
+        if not self.processed_results:
+            return -1
+        data = self.processed_results[self.current_idx]
+        ih, iw = data["image_bgr"].shape[:2]
+        if img_x < 0 or img_y < 0 or img_x >= iw or img_y >= ih:
+            return -1
+
+        for i, mask in enumerate(data["masks"]):
+            if mask is None:
+                continue
+            if mask.ndim == 2 and 0 <= img_y < mask.shape[0] and 0 <= img_x < mask.shape[1]:
+                if mask[img_y, img_x] > MASK_THRESH:
+                    return i
+
+        for i, box in enumerate(data["boxes_xyxy"]):
+            x1, y1, x2, y2 = box.astype(int)
+            if x1 <= img_x <= x2 and y1 <= img_y <= y2:
+                return i
+
+        return -1
+
+    def on_mouse_move(self, e):
+        if self._is_dragging or not self.processed_results:
+            return
+        if not self.show_yolo or not self.show_sam2 or not self.show_labels:
+            img_x, img_y = self._canvas_to_image_coords(e.x, e.y)
+            new_hover = self._hit_test(img_x, img_y)
+        else:
+            new_hover = -1
+
+        if new_hover != self.hover_idx:
+            self.hover_idx = new_hover
+            self.invalidate_cache()
+            self.update_display()
+
+        if new_hover >= 0:
+            data = self.processed_results[self.current_idx]
+            mat = data["materials"][new_hover] if new_hover < len(data["materials"]) else "?"
+            conf = data["confidences"][new_hover] if new_hover < len(data["confidences"]) else 0
+            self.lbl_hover.config(text=f"Hovering: #{new_hover + 1} — {mat} ({conf:.0%})")
+        else:
+            self.lbl_hover.config(text="")
+
+    def on_mouse_leave(self, _):
+        if self.hover_idx != -1:
+            self.hover_idx = -1
+            self.invalidate_cache()
+            self.update_display()
+            self.lbl_hover.config(text="")
+
+    # -----------------------------------------------
+    # Viewport
+    # -----------------------------------------------
     def reset_view(self):
         self.user_zoom = 1.0
         self.pan_x = 0.0
         self.pan_y = 0.0
+        self.hover_idx = -1
 
     def effective_scale(self, img_w, img_h, cw, ch):
         if img_w <= 0 or img_h <= 0 or cw <= 1 or ch <= 1:
@@ -394,6 +475,7 @@ class ChemicalIdentificationViewer:
 
     def on_drag_start(self, e):
         self._drag_last_x, self._drag_last_y = e.x, e.y
+        self._is_dragging = True
 
     def on_drag_move(self, e):
         if self._drag_last_x is None:
@@ -405,6 +487,7 @@ class ChemicalIdentificationViewer:
 
     def on_drag_end(self, _):
         self._drag_last_x = self._drag_last_y = None
+        self._is_dragging = False
 
     def _zoom_modifier(self, e):
         return bool(getattr(e, "state", 0) & 0x001C)
@@ -461,6 +544,7 @@ class ChemicalIdentificationViewer:
     def reset_zoom_key(self, _=None):
         if self.processed_results:
             self.reset_view()
+            self.invalidate_cache()
             self.update_display()
 
     # -----------------------------------------------
@@ -502,7 +586,6 @@ class ChemicalIdentificationViewer:
 
             pred_masks = []
             materials = []
-            vote_details = []
 
             if len(boxes) > 0:
                 predictor.set_image(img_rgb)
@@ -516,36 +599,24 @@ class ChemicalIdentificationViewer:
                     if m0.ndim == 3:
                         m0 = m0.squeeze(0)
                     pred_masks.append(m0)
-
-                    material, votes = classify_mask(m0, chem_grid, h, w)
-                    materials.append(material)
-                    vote_details.append(votes)
-
-            overlay_bgr = draw_material_overlays(
-                img_bgr, pred_masks, materials, boxes, confs
-            )
-
-            pil_overlay = Image.fromarray(cv2.cvtColor(overlay_bgr, cv2.COLOR_BGR2RGB))
-            pil_original = Image.fromarray(img_rgb)
-
-            material_counts = Counter(materials)
+                    mat, _ = classify_mask(m0, chem_grid, h, w)
+                    materials.append(mat)
 
             self.processed_results.append({
-                "image_overlay": pil_overlay,
-                "image_original": pil_original,
+                "image_bgr": img_bgr,
+                "masks": pred_masks,
+                "boxes_xyxy": boxes,
+                "confidences": confs,
+                "materials": materials,
+                "material_counts": Counter(materials),
                 "filename": os.path.basename(img_path),
                 "csv_file": os.path.basename(csv_path),
-                "n_detections": len(boxes),
-                "materials": materials,
-                "material_counts": material_counts,
-                "vote_details": vote_details,
-                "confidences": confs,
             })
 
             self.progress_val = (idx + 1) / total * 100.0
             print(
                 f"[{idx + 1}/{total}] {os.path.basename(img_path)}: "
-                f"{len(boxes)} detections -> {dict(material_counts)}"
+                f"{len(boxes)} detections -> {dict(Counter(materials))}"
             )
 
         self.is_processing = False
@@ -594,33 +665,47 @@ class ChemicalIdentificationViewer:
             self.canvas.coords(self.canvas_img_id, self.pan_x, self.pan_y)
 
         data = self.processed_results[self.current_idx]
+        n = len(data["boxes_xyxy"])
         self.lbl_counter.config(text=f"{self.current_idx + 1} / {len(self.processed_results)}")
 
         counts = data["material_counts"]
-        parts = [f"{mat}: {n}" for mat, n in sorted(counts.items())]
-        self.lbl_summary.config(text=f"Detected {data['n_detections']} particles | {', '.join(parts) or 'none'}")
-
+        parts = [f"{mat}: {cnt}" for mat, cnt in sorted(counts.items())]
+        self.lbl_summary.config(text=f"Detected {n} particles | {', '.join(parts) or 'none'}")
         self.lbl_img_info.config(text=f"{data['filename']}  |  CSV: {data['csv_file']}")
-        self.root.title(
-            f"Chemical ID | {data['filename']} | "
-            f"{data['n_detections']} particles | "
-            f"Overlays: {'ON' if self.show_overlays else 'OFF'} | "
-            f"Zoom: {self.user_zoom:.2f}x"
-        )
 
     def update_buttons(self):
         self.btn_prev.config(state=tk.NORMAL if self.current_idx > 0 else tk.DISABLED)
         self.btn_next.config(state=tk.NORMAL if self.current_idx < len(self.processed_results) - 1 else tk.DISABLED)
 
-    def toggle_overlays(self):
-        self.show_overlays = not self.show_overlays
-        self.btn_toggle.config(text="Hide Overlays" if self.show_overlays else "Show Overlays")
+    # -----------------------------------------------
+    # Toggles
+    # -----------------------------------------------
+    def toggle_yolo(self):
+        self.show_yolo = not self.show_yolo
+        self._update_toggle_btn(self.btn_yolo, "YOLO", self.show_yolo)
+        self.invalidate_cache()
         self.update_display()
 
+    def toggle_sam2(self):
+        self.show_sam2 = not self.show_sam2
+        self._update_toggle_btn(self.btn_sam2, "SAM2", self.show_sam2)
+        self.invalidate_cache()
+        self.update_display()
+
+    def toggle_labels(self):
+        self.show_labels = not self.show_labels
+        self._update_toggle_btn(self.btn_labels, "Labels", self.show_labels)
+        self.invalidate_cache()
+        self.update_display()
+
+    # -----------------------------------------------
+    # Navigation
+    # -----------------------------------------------
     def next_img(self):
         if self.current_idx < len(self.processed_results) - 1:
             self.current_idx += 1
             self.reset_view()
+            self.invalidate_cache()
             self.update_display()
             self.update_buttons()
 
@@ -628,6 +713,7 @@ class ChemicalIdentificationViewer:
         if self.current_idx > 0:
             self.current_idx -= 1
             self.reset_view()
+            self.invalidate_cache()
             self.update_display()
             self.update_buttons()
 
@@ -642,7 +728,6 @@ class ChemicalIdentificationViewer:
         self._export_progress = (0, len(self.processed_results))
         self.btn_export.config(state=tk.DISABLED)
         self.lbl_export.config(text="Exporting...")
-
         self._export_thread = threading.Thread(target=self._export_worker, daemon=True)
         self._export_thread.start()
         self._poll_export()
@@ -659,14 +744,15 @@ class ChemicalIdentificationViewer:
         self._export_dir = run_dir
 
         snapshot = list(self.processed_results)
-        img_key = "image_overlay" if self.show_overlays else "image_original"
-
         for i, item in enumerate(snapshot, start=1):
-            img: Image.Image = item[img_key]
+            bgr = compose_image(
+                item["image_bgr"], item["masks"], item["materials"],
+                item["boxes_xyxy"], item["confidences"],
+                show_yolo=True, show_sam2=True, show_labels=True, hover_idx=-1,
+            )
+            pil = Image.fromarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
             base = os.path.splitext(item["filename"])[0]
-            suffix = "_overlay" if self.show_overlays else "_original"
-            out_path = os.path.join(run_dir, f"{base}{suffix}.png")
-            img.save(out_path, format="PNG")
+            pil.save(os.path.join(run_dir, f"{base}_chemical_id.png"), format="PNG")
             self._export_progress = (i, len(snapshot))
 
         self._export_done = True
@@ -674,13 +760,11 @@ class ChemicalIdentificationViewer:
     def _poll_export(self):
         done, total = self._export_progress
         self.lbl_export.config(text=f"Export: {done}/{total} saved")
-
         if self._export_done:
             self.is_exporting = False
             self.btn_export.config(state=tk.NORMAL)
             self.lbl_export.config(text=f"Exported {total} images to {self._export_dir}")
             return
-
         self.root.after(150, self._poll_export)
 
 

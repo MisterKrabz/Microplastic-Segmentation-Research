@@ -17,7 +17,7 @@ from sam2.sam2_image_predictor import SAM2ImagePredictor
 # CONFIGURATION
 # ==========================================
 # Comma-separated list of folder paths containing images
-SOURCE_PATHS = "./../../datasets/ES-T2024_LakeMendota.v3i.yolov8,./../../datasets/Microplastics-V3-ValidSplit"
+SOURCE_PATHS = "./../../datasets/NewImagesForSegmentationTesting"
 YOLO_MODEL_PATH = "./../../models/hunter-yolo-v0.4.4.pt"
 
 # SAM2
