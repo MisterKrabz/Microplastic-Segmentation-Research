@@ -8,6 +8,7 @@ import torch
 from PIL import Image, ImageTk
 from ultralytics import YOLO
 from datetime import datetime
+import openpyxl
 
 # --- NATIVE SAM2 IMPORTS ---
 from sam2.build_sam import build_sam2
@@ -17,15 +18,16 @@ from sam2.sam2_image_predictor import SAM2ImagePredictor
 # CONFIGURATION
 # ==========================================
 # Comma-separated list of folder paths containing images
-SOURCE_PATHS = "./../../datasets/NewImagesForSegmentationTesting"
-YOLO_MODEL_PATH = "./../../models/hunter-yolo-v0.4.4.pt"
+SOURCE_PATHS = "./../../datasets/OriginalImage"
+YOLO_MODEL_PATH = "./../../models/hunter-yolo-v0.4.7.pt"
+COUNTING_XLSX = "./../../datasets/Quantification/Counting.xlsx"
 
 # SAM2
 SAM2_CHECKPOINT = "./../../models/sam2.1_hiera_large.pt"
 SAM2_CONFIG_NAME = "configs/sam2.1/sam2.1_hiera_l.yaml"
 
 # YOLO inference
-CONFIDENCE = 0.1
+CONFIDENCE = 0.35
 IOU_THRESH = 0.25
 IMG_SIZE = 1280
 
@@ -43,7 +45,6 @@ DEVICE = (
 
 VALID_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff")
 
-BOX_SHRINK = 0.10
 MASK_THRESH = 0.5
 MASK_ALPHA = 0.45
 
@@ -205,29 +206,6 @@ def count_gt_instances(label_path: str) -> int:
 # ==========================================
 # Drawing helpers
 # ==========================================
-def shrink_box_xyxy(box_xyxy: np.ndarray, w: int, h: int, frac: float) -> np.ndarray:
-    if frac <= 0:
-        return box_xyxy
-
-    x1, y1, x2, y2 = box_xyxy.astype(np.float32)
-    bw = max(1.0, x2 - x1)
-    bh = max(1.0, y2 - y1)
-
-    dx = bw * frac
-    dy = bh * frac
-
-    x1n = np.clip(x1 + dx, 0, w - 1)
-    y1n = np.clip(y1 + dy, 0, h - 1)
-    x2n = np.clip(x2 - dx, 0, w - 1)
-    y2n = np.clip(y2 - dy, 0, h - 1)
-
-    if x2n <= x1n + 1:
-        x1n, x2n = x1, x2
-    if y2n <= y1n + 1:
-        y1n, y2n = y1, y2
-
-    return np.array([x1n, y1n, x2n, y2n], dtype=np.float32)
-
 
 def draw_yolo_boxes_custom(
     image_bgr: np.ndarray,
@@ -290,7 +268,12 @@ def draw_yolo_boxes_custom(
     return out
 
 
-def draw_masks_on_top(base_bgr: np.ndarray, masks: list[np.ndarray], alpha: float = MASK_ALPHA) -> np.ndarray:
+def draw_masks_on_top(
+    base_bgr: np.ndarray,
+    masks: list[np.ndarray],
+    alpha: float = MASK_ALPHA,
+    force_color: tuple | None = None,
+) -> np.ndarray:
     out = base_bgr.copy()
     overlay = base_bgr.copy()
 
@@ -302,13 +285,59 @@ def draw_masks_on_top(base_bgr: np.ndarray, masks: list[np.ndarray], alpha: floa
         if mask_bin.sum() == 0:
             continue
 
-            # random contour color
-        color = np.random.randint(0, 255, (3,), dtype=np.uint8).tolist()
+        color = list(force_color) if force_color else np.random.randint(0, 255, (3,), dtype=np.uint8).tolist()
         contours, _ = cv2.findContours(mask_bin, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         cv2.drawContours(overlay, contours, -1, color, -1)
         cv2.drawContours(out, contours, -1, color, 2)
 
     return cv2.addWeighted(overlay, alpha, out, 1 - alpha, 0)
+
+
+RED_BGR = (0, 0, 255)
+BLUE_BGR = (255, 0, 0)
+
+
+def compose_layers(
+    pil_original: Image.Image,
+    yolo_xyxy: np.ndarray,
+    yolo_confs: np.ndarray,
+    yolo_clss: np.ndarray,
+    yolo_names: dict,
+    pred_masks_bin: list[np.ndarray],
+    show_boxes: bool = True,
+    show_labels: bool = True,
+    show_masks: bool = True,
+    use_red: bool = False,
+) -> Image.Image:
+    bgr = cv2.cvtColor(np.array(pil_original), cv2.COLOR_RGB2BGR)
+    box_color = RED_BGR
+    mask_color = BLUE_BGR if not use_red else RED_BGR
+
+    if show_masks and pred_masks_bin:
+        bgr = draw_masks_on_top(bgr, pred_masks_bin, alpha=MASK_ALPHA, force_color=mask_color)
+
+    if show_boxes and len(yolo_xyxy) > 0:
+        for box, conf, cls_id in zip(yolo_xyxy, yolo_confs, yolo_clss):
+            x1, y1, x2, y2 = int(box[0]), int(box[1]), int(box[2]), int(box[3])
+            cv2.rectangle(bgr, (x1, y1), (x2, y2), box_color, BOX_LINE_WIDTH)
+
+            if show_labels:
+                cls_name = yolo_names.get(int(cls_id), str(int(cls_id)))
+                lbl = f"{cls_name} {conf:.2f}" if SHOW_CLASS_NAME else f"{conf:.2f}"
+                (tw, th), baseline = cv2.getTextSize(
+                    lbl, cv2.FONT_HERSHEY_SIMPLEX, LABEL_FONT_SCALE, LABEL_FONT_THICKNESS
+                )
+                tx, ty = x1 + 4, y1 - 6
+                bg_l, bg_t = x1, y1 - th - baseline - 8
+                bg_r, bg_b = x1 + tw + 8, y1
+                if bg_t < 0:
+                    bg_t, bg_b = y1, y1 + th + baseline + 8
+                    ty = y1 + th + 4
+                cv2.rectangle(bgr, (bg_l, bg_t), (bg_r, bg_b), box_color, -1)
+                cv2.putText(bgr, lbl, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX,
+                            LABEL_FONT_SCALE, (255, 255, 255), LABEL_FONT_THICKNESS, cv2.LINE_AA)
+
+    return Image.fromarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
 
 
 # ==========================================
@@ -325,7 +354,10 @@ class NativeSAM2YOLOViewer:
         self.current_idx = 0
         self.is_processing = True
         self.progress_val = 0.0
-        self.show_overlays = True
+        self.show_yolo = True
+        self.show_sam2 = True
+        self.show_labels = True
+        self.use_red = False
 
         # Segmentation accuracy metrics
         self.total_gt = 0
@@ -425,13 +457,40 @@ class NativeSAM2YOLOViewer:
         )
         self.btn_export.pack(side=tk.RIGHT, padx=10)
 
-        self.btn_toggle_overlays = tk.Button(
+        self.btn_export_counts = tk.Button(
             frame_bot,
-            text="Toggle Overlays",
-            command=self.toggle_overlays,
+            text="Export Counts",
+            command=self.export_counts,
+            state=tk.DISABLED,
             width=14
         )
-        self.btn_toggle_overlays.pack(side=tk.RIGHT, padx=10)
+        self.btn_export_counts.pack(side=tk.RIGHT, padx=10)
+
+        self.btn_toggle_color = tk.Button(
+            frame_bot,
+            text="Color: Default",
+            command=self.toggle_color,
+            width=14
+        )
+        self.btn_toggle_color.pack(side=tk.RIGHT, padx=10)
+
+        self.btn_toggle_labels = tk.Button(
+            frame_bot, text="Toggle Labels",
+            command=self.toggle_labels, width=14,
+        )
+        self.btn_toggle_labels.pack(side=tk.RIGHT, padx=4)
+
+        self.btn_toggle_sam2 = tk.Button(
+            frame_bot, text="Toggle SAM2",
+            command=self.toggle_sam2, width=14,
+        )
+        self.btn_toggle_sam2.pack(side=tk.RIGHT, padx=4)
+
+        self.btn_toggle_yolo = tk.Button(
+            frame_bot, text="Toggle YOLO",
+            command=self.toggle_yolo, width=14,
+        )
+        self.btn_toggle_yolo.pack(side=tk.RIGHT, padx=4)
 
     def bind_navigation_events(self):
         self.root.bind("<Configure>", self.on_window_resize)
@@ -481,7 +540,8 @@ class NativeSAM2YOLOViewer:
                 continue
 
             if os.path.isdir(dataset_root):
-                for r, _, files in os.walk(dataset_root):
+                for r, dirs, files in os.walk(dataset_root):
+                    dirs[:] = [d for d in dirs if d != EXPORT_ROOT_NAME]
                     for f in files:
                         if f.lower().endswith(VALID_EXTS):
                             image_paths.append(os.path.join(r, f))
@@ -495,8 +555,18 @@ class NativeSAM2YOLOViewer:
         if not self.processed_results:
             return None
         data = self.processed_results[self.current_idx]
-        key = "image_with_overlays" if self.show_overlays else "image_original"
-        return data[key]
+        if not self.show_yolo and not self.show_sam2 and not self.show_labels:
+            return data["image_original"]
+        return compose_layers(
+            data["image_original"],
+            data["yolo_xyxy"], data["yolo_confs"],
+            data["yolo_clss"], data["yolo_names"],
+            data["pred_masks_bin"],
+            show_boxes=self.show_yolo,
+            show_labels=self.show_labels,
+            show_masks=self.show_sam2,
+            use_red=self.use_red,
+        )
 
     def reset_view(self):
         self.user_zoom = 1.0
@@ -676,7 +746,9 @@ class NativeSAM2YOLOViewer:
                 iou=IOU_THRESH,
                 imgsz=IMG_SIZE,
                 verbose=False,
-                agnostic_nms=True
+                agnostic_nms=True,
+                augment=True,
+                max_det=1000,
             )
             r0 = results[0]
 
@@ -702,7 +774,6 @@ class NativeSAM2YOLOViewer:
                 predictor.set_image(img_rgb)
 
                 for b in boxes:
-                    b = shrink_box_xyxy(b, w=w, h=h, frac=BOX_SHRINK)
                     m, scores, _ = predictor.predict(
                         point_coords=None,
                         point_labels=None,
@@ -734,6 +805,12 @@ class NativeSAM2YOLOViewer:
             pil_img_with_overlays = Image.fromarray(cv2.cvtColor(final_bgr_with_overlays, cv2.COLOR_BGR2RGB))
             pil_img_original = Image.fromarray(img_rgb)
 
+            yolo_xyxy = r0.boxes.xyxy.cpu().numpy().astype(int) if len(r0.boxes) > 0 else np.empty((0, 4), dtype=int)
+            yolo_confs = r0.boxes.conf.cpu().numpy() if len(r0.boxes) > 0 and r0.boxes.conf is not None else np.array([])
+            yolo_clss = r0.boxes.cls.cpu().numpy().astype(int) if len(r0.boxes) > 0 and r0.boxes.cls is not None else np.array([], dtype=int)
+            yolo_names = r0.names if hasattr(r0, "names") else {}
+            pred_masks_bin = [(m > MASK_THRESH).astype(np.uint8) for m in pred_masks]
+
             self.processed_results.append({
                 "image_with_overlays": pil_img_with_overlays,
                 "image_original": pil_img_original,
@@ -746,22 +823,94 @@ class NativeSAM2YOLOViewer:
                 "fn": fn,
                 "label_path": lbl_path,
                 "src_path": img_path,
+                "yolo_xyxy": yolo_xyxy,
+                "yolo_confs": yolo_confs,
+                "yolo_clss": yolo_clss,
+                "yolo_names": yolo_names,
+                "pred_masks_bin": pred_masks_bin,
             })
 
             self.progress_val = (i + 1) / total * 100.0
+            print(
+                f"[{i + 1}/{total}] {os.path.basename(img_path)}: "
+                f"YOLO detected {pred_count} microplastics (GT: {gt_count})"
+            )
 
         self.is_processing = False
 
     # -------------------------
+    # Export counts to Counting.xlsx
+    # -------------------------
+    def export_counts(self):
+        if not self.processed_results:
+            self.lbl_export.config(text="Export Counts: nothing to export yet.")
+            return
+        self.btn_export_counts.config(state=tk.DISABLED)
+        self.write_to_xlsx()
+        self.btn_export_counts.config(state=tk.NORMAL)
+
+    def write_to_xlsx(self):
+        if not self.processed_results:
+            return
+
+        xlsx_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), COUNTING_XLSX
+        )
+        xlsx_path = os.path.normpath(xlsx_path)
+
+        if os.path.exists(xlsx_path):
+            wb = openpyxl.load_workbook(xlsx_path)
+            ws = wb.active
+        else:
+            wb = openpyxl.Workbook()
+            ws = wb.active
+            ws["B1"] = "Image name"
+            ws["C1"] = "PS size (um)"
+            ws["D1"] = "Conc. (mgL)"
+            ws["E1"] = "Counted # by algorithm"
+            ws["F1"] = "Counted # by human"
+
+        existing_names = set()
+        for row in ws.iter_rows(min_row=2, max_col=2, values_only=True):
+            if row[0] is not None:
+                existing_names.add(str(row[0]).strip())
+
+        next_row = ws.max_row + 1
+
+        written = 0
+        for data in self.processed_results:
+            image_name = os.path.splitext(data["filename"])[0]
+            if image_name in existing_names:
+                for r in range(2, ws.max_row + 1):
+                    cell_val = ws.cell(row=r, column=2).value
+                    if cell_val is not None and str(cell_val).strip() == image_name:
+                        ws.cell(row=r, column=5, value=data["pred_count"])
+                        written += 1
+                        break
+            else:
+                ws.cell(row=next_row, column=2, value=image_name)
+                ws.cell(row=next_row, column=5, value=data["pred_count"])
+                existing_names.add(image_name)
+                next_row += 1
+                written += 1
+
+        wb.save(xlsx_path)
+        msg = f"Exported {written} counts to Counting.xlsx"
+        print(msg)
+        self.lbl_export.config(text=msg)
+
+    # -------------------------
     # Export logic
     # -------------------------
-    def make_export_dir(self) -> str:
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        first_path = SOURCE_PATHS.split(",")[0].strip()
-        export_root = os.path.join(first_path, EXPORT_ROOT_NAME)
-        os.makedirs(export_root, exist_ok=True)
+    def make_export_dir(self, layer_parts: list[str]) -> str:
+        first_path = os.path.normpath(SOURCE_PATHS.split(",")[0].strip())
+        parent_dir = os.path.dirname(first_path)
+        base_name = os.path.basename(first_path)
 
-        export_dir = os.path.join(export_root, f"{EXPORT_PREFIX}_{ts}")
+        suffix = "_".join(layer_parts) if layer_parts else "original"
+        folder_name = f"{base_name}_{suffix}"
+
+        export_dir = os.path.join(parent_dir, folder_name)
         os.makedirs(export_dir, exist_ok=True)
         return export_dir
 
@@ -773,28 +922,94 @@ class NativeSAM2YOLOViewer:
             self.lbl_export.config(text="Export: nothing ready yet.")
             return
 
-        self.export_dir = self.make_export_dir()
+        self._show_export_dialog()
+
+    def _show_export_dialog(self):
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Export Options")
+        dialog.geometry("320x300")
+        dialog.resizable(False, False)
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        tk.Label(
+            dialog, text="Select layers to include:",
+            font=("Arial", 12, "bold")
+        ).pack(pady=(18, 12))
+
+        var_boxes = tk.BooleanVar(value=True)
+        var_labels = tk.BooleanVar(value=True)
+        var_masks = tk.BooleanVar(value=True)
+        var_red = tk.BooleanVar(value=self.use_red)
+
+        opts_frame = tk.Frame(dialog)
+        opts_frame.pack(anchor="w", padx=40)
+
+        tk.Checkbutton(opts_frame, text="YOLO Boxes", variable=var_boxes,
+                        font=("Arial", 11)).pack(anchor="w", pady=2)
+        tk.Checkbutton(opts_frame, text="YOLO Labels", variable=var_labels,
+                        font=("Arial", 11)).pack(anchor="w", pady=2)
+        tk.Checkbutton(opts_frame, text="SAM2 Masks", variable=var_masks,
+                        font=("Arial", 11)).pack(anchor="w", pady=2)
+        tk.Checkbutton(opts_frame, text="Red Color", variable=var_red,
+                        font=("Arial", 11)).pack(anchor="w", pady=2)
+
+        btn_frame = tk.Frame(dialog)
+        btn_frame.pack(pady=20)
+
+        def on_export():
+            dialog.destroy()
+            self._run_export(var_boxes.get(), var_labels.get(), var_masks.get(), var_red.get())
+
+        def on_cancel():
+            dialog.destroy()
+
+        tk.Button(btn_frame, text="Cancel", command=on_cancel, width=10).pack(side=tk.LEFT, padx=10)
+        tk.Button(btn_frame, text="Export", command=on_export, width=10).pack(side=tk.LEFT, padx=10)
+
+    def _run_export(self, show_boxes, show_labels, show_masks, use_red):
+        parts = []
+        if show_boxes:
+            parts.append("yolo")
+        if show_labels:
+            parts.append("labels")
+        if show_masks:
+            parts.append("sam2")
+        if use_red:
+            parts.append("red")
+
+        self.export_dir = self.make_export_dir(parts)
         self.is_exporting = True
         self._export_done = False
         self._export_progress = (0, max(1, len(self.processed_results)))
         self.btn_export.config(state=tk.DISABLED)
         self.lbl_export.config(text=f"Export: writing to {self.export_dir}")
 
+        self._export_options = (show_boxes, show_labels, show_masks, use_red)
         self.export_thread = threading.Thread(target=self._export_worker, daemon=True)
         self.export_thread.start()
         self._poll_export_done()
 
     def _export_worker(self):
+        show_boxes, show_labels, show_masks, use_red = self._export_options
         results_snapshot = list(self.processed_results)
-        img_key = "image_with_overlays" if self.show_overlays else "image_original"
 
         for idx, item in enumerate(results_snapshot, start=1):
-            img: Image.Image = item[img_key]
+            img = compose_layers(
+                item["image_original"],
+                item["yolo_xyxy"], item["yolo_confs"],
+                item["yolo_clss"], item["yolo_names"],
+                item["pred_masks_bin"],
+                show_boxes=show_boxes,
+                show_labels=show_labels,
+                show_masks=show_masks,
+                use_red=use_red,
+            )
+
             src_path = item.get("src_path", "")
             base = os.path.splitext(os.path.basename(src_path))[0] if src_path else os.path.splitext(item["filename"])[0]
 
-            suffix = "_with_overlays" if self.show_overlays else "_original"
-            out_name = f"{base}_yolo_sam2{suffix}.png"
+            out_name = f"{base}.png"
             out_path = os.path.join(self.export_dir, out_name)
 
             img.save(out_path, format="PNG")
@@ -804,7 +1019,7 @@ class NativeSAM2YOLOViewer:
 
     def _poll_export_done(self):
         done, total = self._export_progress
-        self.lbl_export.config(text=f"Export: {done}/{total} saved → {self.export_dir}")
+        self.lbl_export.config(text=f"Export: {done}/{total} saved -> {self.export_dir}")
 
         if self._export_done:
             self.is_exporting = False
@@ -836,6 +1051,7 @@ class NativeSAM2YOLOViewer:
 
         if len(self.processed_results) > 0 and not self.is_exporting:
             self.btn_export.config(state=tk.NORMAL)
+            self.btn_export_counts.config(state=tk.NORMAL)
 
         if self.is_processing:
             done = len(self.processed_results)
@@ -846,6 +1062,7 @@ class NativeSAM2YOLOViewer:
             self.update_buttons()
             if len(self.processed_results) > 0 and not self.is_exporting:
                 self.btn_export.config(state=tk.NORMAL)
+                self.btn_export_counts.config(state=tk.NORMAL)
 
     def update_display(self):
         pil_img = self.get_current_pil_image()
@@ -891,7 +1108,9 @@ class NativeSAM2YOLOViewer:
 
         iou_str = f"{mean_iou * 100:.1f}%" if mean_iou is not None else "--"
         self.root.title(
-            f"YOLO+SAM2 Seg | {data['filename']} | IoU: {iou_str} | Pred/GT: {pred}/{gt} | Overlays: {'ON' if self.show_overlays else 'OFF'} | Zoom: {self.user_zoom:.2f}x"
+            f"YOLO+SAM2 Seg | {data['filename']} | IoU: {iou_str} | Pred/GT: {pred}/{gt} "
+            f"| YOLO: {'ON' if self.show_yolo else 'OFF'} | SAM2: {'ON' if self.show_sam2 else 'OFF'} "
+            f"| Labels: {'ON' if self.show_labels else 'OFF'} | Zoom: {self.user_zoom:.2f}x"
         )
 
     def update_buttons(self):
@@ -900,8 +1119,21 @@ class NativeSAM2YOLOViewer:
         self.btn_prev.config(state=state_prev)
         self.btn_next.config(state=state_next)
 
-    def toggle_overlays(self):
-        self.show_overlays = not self.show_overlays
+    def toggle_yolo(self):
+        self.show_yolo = not self.show_yolo
+        self.update_display()
+
+    def toggle_sam2(self):
+        self.show_sam2 = not self.show_sam2
+        self.update_display()
+
+    def toggle_labels(self):
+        self.show_labels = not self.show_labels
+        self.update_display()
+
+    def toggle_color(self):
+        self.use_red = not self.use_red
+        self.btn_toggle_color.config(text="Color: Red" if self.use_red else "Color: Default")
         self.update_display()
 
     def next_img(self):

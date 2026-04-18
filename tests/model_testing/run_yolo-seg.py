@@ -6,15 +6,17 @@ from tkinter import ttk
 from PIL import Image, ImageTk
 from ultralytics import YOLO
 import numpy as np
+import openpyxl
 
 # ==========================================
 # CONFIGURATION
 # ==========================================
-SOURCE_PATH = "./../datasets/Microplastics-Bounding-Box"
-MODEL_PATH  = "../models/baseline-no_augmentations.pt"
+SOURCE_PATH = "./../../datasets/Quantification"
+MODEL_PATH  = "../../models/hunter-yolo-v0.4.4.pt"
+COUNTING_XLSX = "./../../datasets/Quantification/Counting.xlsx"
 
-CONFIDENCE = 0.01
-IOU_THRESH = 0.0
+CONFIDENCE = 0.1
+IOU_THRESH = 0.25
 IMG_SIZE   = 1280
 
 SPLITS = ["train", "valid", "test"]
@@ -233,10 +235,7 @@ class MicroplasticViewer:
         self.check_for_updates()
 
     def get_image_list(self, dataset_root):
-        """
-        ORIGINAL LOGIC preserved (walks folders), but restricted to:
-        dataset_root/train|valid|test/images/** and only image extensions.
-        """
+        """Walk the dataset root recursively and collect all image files."""
         image_paths = []
         if os.path.isfile(dataset_root):
             if dataset_root.lower().endswith(VALID_EXTS):
@@ -244,14 +243,10 @@ class MicroplasticViewer:
             return []
 
         if os.path.isdir(dataset_root):
-            for split in SPLITS:
-                images_dir = os.path.join(dataset_root, split, "images")
-                if not os.path.isdir(images_dir):
-                    continue
-                for root, dirs, files in os.walk(images_dir):
-                    for file in files:
-                        if file.lower().endswith(VALID_EXTS):
-                            image_paths.append(os.path.join(root, file))
+            for root, dirs, files in os.walk(dataset_root):
+                for file in files:
+                    if file.lower().endswith(VALID_EXTS):
+                        image_paths.append(os.path.join(root, file))
 
         return sorted(image_paths)
 
@@ -276,7 +271,7 @@ class MicroplasticViewer:
                 iou=IOU_THRESH,
                 imgsz=IMG_SIZE,
                 verbose=False,
-                agnostic_nms=False
+                agnostic_nms=True
             )
 
             r0 = results[0]
@@ -320,8 +315,43 @@ class MicroplasticViewer:
             })
 
             self.progress_val = (i + 1) / total * 100
+            print(
+                f"[{i + 1}/{total}] {filename}: "
+                f"YOLO detected {pred_count} microplastics"
+            )
 
+        self.write_to_xlsx()
         self.is_processing = False
+
+    def write_to_xlsx(self):
+        """Write image names and YOLO detection counts into the Counting.xlsx file."""
+        if not self.processed_results:
+            return
+
+        xlsx_path = os.path.abspath(COUNTING_XLSX)
+        if os.path.exists(xlsx_path):
+            wb = openpyxl.load_workbook(xlsx_path)
+            ws = wb.active
+        else:
+            wb = openpyxl.Workbook()
+            ws = wb.active
+            ws["B1"] = "Image name"
+            ws["C1"] = "PS size (um)"
+            ws["D1"] = "Conc. (mgL)"
+            ws["E1"] = "Counted # by algorithm"
+            ws["F1"] = "Counted # by human"
+
+        start_row = ws.max_row + 1
+
+        for i, data in enumerate(self.processed_results):
+            row = start_row + i
+            image_name = os.path.splitext(data["filename"])[0]
+            pred_count = data["pred_count"]
+            ws.cell(row=row, column=2, value=image_name)
+            ws.cell(row=row, column=5, value=pred_count)
+
+        wb.save(xlsx_path)
+        print(f"Wrote {len(self.processed_results)} rows to {xlsx_path}")
 
     def check_for_updates(self):
         self.progress['value'] = self.progress_val
