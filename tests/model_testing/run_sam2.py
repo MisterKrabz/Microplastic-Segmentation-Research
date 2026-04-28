@@ -6,42 +6,56 @@ from tkinter import ttk
 import numpy as np
 import torch
 from PIL import Image, ImageTk
-from ultralytics import YOLO
-from datetime import datetime
 import openpyxl
 
 # --- NATIVE SAM2 IMPORTS ---
 from sam2.build_sam import build_sam2
-from sam2.sam2_image_predictor import SAM2ImagePredictor
+from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
 
 # ==========================================
 # CONFIGURATION
 # ==========================================
 # Comma-separated list of folder paths containing images
 SOURCE_PATHS = "./../../datasets/testing_datasets/Quantification"
-YOLO_MODEL_PATH = "./../../models/hunter-yolo-v0.5.4/hunter-yolo-v0.5.4.pt"
 COUNTING_XLSX = "./../../datasets/testing_datasets/Quantification/Counting.xlsx"
 
 # Header text to locate columns inside Counting.xlsx. The header row is found
 # dynamically (e.g. headers may sit in row 2 rather than row 1), and these
 # header strings are then used to resolve the right columns.
 COUNTING_IMAGE_NAME_HEADER = "Image name"
-COUNTING_V3_HEADER = "Counted # by v3"
+COUNTING_SAM2_HEADER = "Counted # by SAM2 only"
 
 # SAM2
 SAM2_CHECKPOINT = "./../../models/sam2.1_hiera_large.pt"
 SAM2_CONFIG_NAME = "configs/sam2.1/sam2.1_hiera_l.yaml"
 
-# YOLO inference
-CONFIDENCE = 0.2
-IOU_THRESH = 0.5
-IMG_SIZE = 1280
+# SAM2 automatic mask generator settings. These are the SAM2-only "baseline"
+# parameters: SAM2 is run as a class-agnostic segmenter that proposes masks
+# from a regular grid of point prompts. The count for each image is then
+# `len(masks)` after the area filter below.
+SAM2_POINTS_PER_SIDE = 32
+SAM2_PRED_IOU_THRESH = 0.7
+SAM2_STABILITY_SCORE_THRESH = 0.85
+SAM2_BOX_NMS_THRESH = 0.7
+SAM2_MIN_MASK_REGION_AREA = 20  # px, removes tiny noise-only masks
+SAM2_CROP_N_LAYERS = 0           # >0 makes it slower but better for tiny objects
 
-# YOLO drawing
-BOX_LINE_WIDTH = 1
+# Post-generation area filter (applied after SAM2's own NMS). Any mask whose
+# area is outside [POST_MIN_AREA_PX, POST_MAX_AREA_FRAC * image_area] is
+# discarded. This removes the inevitable "background" / full-frame masks that
+# the automatic generator produces.
+POST_MIN_AREA_PX = 20
+POST_MAX_AREA_FRAC = 0.01
+
+# YOLO label parsing kept only to surface ground truth so the SAM2 baseline
+# can be measured the same way as run_sequential.
+IOU_THRESH = 0.5
+MASK_THRESH = 0.5
+MASK_ALPHA = 0.45
+
+# Drawing
 LABEL_FONT_SCALE = 0.30
 LABEL_FONT_THICKNESS = 1
-SHOW_CLASS_NAME = False  # False = show only confidence
 
 DEVICE = (
     "cuda" if torch.cuda.is_available()
@@ -51,21 +65,9 @@ DEVICE = (
 
 VALID_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff")
 
-MASK_THRESH = 0.5
-MASK_ALPHA = 0.45
-
-# Cluster suppression: drop a YOLO box if it (nearly) contains >= MIN_CHILDREN
-# other boxes. This removes the "single big mask wrapping a cluster of small
-# microplastics" duplicate that standard IoU-based NMS cannot catch, because
-# such a box has very low IoU with any individual small box inside it.
-CLUSTER_CONTAIN_THRESH = 0.85   # fraction of the smaller box's area that must
-                                # lie inside the larger box to count as contained
-CLUSTER_MIN_CHILDREN = 2        # drop boxes containing this many smaller boxes
-ENABLE_CLUSTER_SUPPRESSION = True
-
 # Export config
 EXPORT_ROOT_NAME = "_exports"
-EXPORT_PREFIX = "yolo_sam2_overlay"
+EXPORT_PREFIX = "sam2_only_overlay"
 
 # Zoom / pan behavior
 ZOOM_STEP = 1.12
@@ -74,7 +76,7 @@ MAX_USER_ZOOM = 12.0
 
 
 # ==========================================
-# GT segmentation helpers
+# GT segmentation helpers (same as run_sequential)
 # ==========================================
 def label_for_image(img_path: str) -> str:
     p = os.path.normpath(img_path)
@@ -95,87 +97,39 @@ def parse_yolo_seg_labels(label_path: str, img_w: int, img_h: int) -> list[np.nd
     masks = []
     if not os.path.exists(label_path):
         return masks
-    
+
     with open(label_path, "r", encoding="utf-8") as f:
         for line in f:
             parts = line.strip().split()
-            if len(parts) < 7:  # class + at least 3 points (6 coords)
+            if len(parts) < 7:
                 continue
-            
+
             coords = list(map(float, parts[1:]))
             if len(coords) % 2 != 0:
                 continue
-            
+
             points = []
             for i in range(0, len(coords), 2):
                 x = int(coords[i] * img_w)
                 y = int(coords[i + 1] * img_h)
                 points.append([x, y])
-            
+
             if len(points) >= 3:
                 mask = np.zeros((img_h, img_w), dtype=np.uint8)
                 pts = np.array(points, dtype=np.int32).reshape((-1, 1, 2))
                 cv2.fillPoly(mask, [pts], 1)
                 masks.append(mask)
-    
+
     return masks
 
 
-def suppress_cluster_boxes(
-    xyxy: np.ndarray,
-    contain_thresh: float = CLUSTER_CONTAIN_THRESH,
-    min_children: int = CLUSTER_MIN_CHILDREN,
-) -> np.ndarray:
-    """Return indices of boxes to keep, dropping any box that nearly contains
-    `min_children` or more strictly-smaller boxes.
-
-    A box i is said to contain box j when
-        intersection(i, j) / area(j) >= contain_thresh   AND   area(i) > area(j)
-    (i.e. i covers most of j's pixels and i is the larger of the two).
-
-    This catches "cluster" detections that wrap several individual particle
-    detections, which standard IoU-based NMS misses because IoU(big, small) is
-    small even when the small box is fully inside the big one.
-    """
-    n = len(xyxy)
-    if n <= 1:
-        return np.arange(n, dtype=int)
-
-    x1 = xyxy[:, 0]
-    y1 = xyxy[:, 1]
-    x2 = xyxy[:, 2]
-    y2 = xyxy[:, 3]
-    areas = np.maximum(0.0, x2 - x1) * np.maximum(0.0, y2 - y1)
-
-    ix1 = np.maximum(x1[:, None], x1[None, :])
-    iy1 = np.maximum(y1[:, None], y1[None, :])
-    ix2 = np.minimum(x2[:, None], x2[None, :])
-    iy2 = np.minimum(y2[:, None], y2[None, :])
-    iw = np.clip(ix2 - ix1, 0.0, None)
-    ih = np.clip(iy2 - iy1, 0.0, None)
-    inter = iw * ih
-
-    area_j = areas[None, :]
-    with np.errstate(divide="ignore", invalid="ignore"):
-        ios_j = np.where(area_j > 0, inter / area_j, 0.0)
-
-    larger = areas[:, None] > areas[None, :]
-    contained = (ios_j >= contain_thresh) & larger
-    np.fill_diagonal(contained, False)
-
-    children_count = contained.sum(axis=1)
-    keep = children_count < min_children
-    return np.nonzero(keep)[0]
-
-
 def compute_mask_iou(mask1: np.ndarray, mask2: np.ndarray) -> float:
-    """Compute IoU between two binary masks."""
     mask1_bool = mask1.astype(bool)
     mask2_bool = mask2.astype(bool)
-    
+
     intersection = np.logical_and(mask1_bool, mask2_bool).sum()
     union = np.logical_or(mask1_bool, mask2_bool).sum()
-    
+
     if union == 0:
         return 0.0
     return float(intersection) / float(union)
@@ -186,43 +140,33 @@ def match_masks_and_compute_accuracy(
     gt_masks: list[np.ndarray],
     iou_threshold: float = 0.5
 ) -> tuple[float, int, int, int, list[float]]:
-    """
-    Match predicted masks to GT masks and compute accuracy metrics.
-    
-    Returns:
-        mean_iou: Average IoU of matched pairs
-        tp: True positives (matched pairs with IoU >= threshold)
-        fp: False positives (unmatched predictions)
-        fn: False negatives (unmatched GT)
-        all_ious: List of best IoU for each GT mask
-    """
     if len(gt_masks) == 0 and len(pred_masks) == 0:
         return 1.0, 0, 0, 0, []
-    
+
     if len(gt_masks) == 0:
         return 0.0, 0, len(pred_masks), 0, []
-    
+
     if len(pred_masks) == 0:
         return 0.0, 0, 0, len(gt_masks), [0.0] * len(gt_masks)
-    
+
     iou_matrix = np.zeros((len(gt_masks), len(pred_masks)), dtype=np.float32)
     for i, gt_mask in enumerate(gt_masks):
         for j, pred_mask in enumerate(pred_masks):
             pred_binary = (pred_mask > MASK_THRESH).astype(np.uint8) if pred_mask.dtype != np.uint8 else pred_mask
             iou_matrix[i, j] = compute_mask_iou(gt_mask, pred_binary)
-    
-    matched_gt = set()
-    matched_pred = set()
-    all_ious = []
-    
+
+    matched_gt: set[int] = set()
+    matched_pred: set[int] = set()
+    all_ious: list[float] = []
+
     while True:
         if len(matched_gt) == len(gt_masks) or len(matched_pred) == len(pred_masks):
             break
-        
-        best_iou = -1
+
+        best_iou = -1.0
         best_gt_idx = -1
         best_pred_idx = -1
-        
+
         for i in range(len(gt_masks)):
             if i in matched_gt:
                 continue
@@ -230,28 +174,28 @@ def match_masks_and_compute_accuracy(
                 if j in matched_pred:
                     continue
                 if iou_matrix[i, j] > best_iou:
-                    best_iou = iou_matrix[i, j]
+                    best_iou = float(iou_matrix[i, j])
                     best_gt_idx = i
                     best_pred_idx = j
-        
+
         if best_iou < 0:
             break
-        
+
         matched_gt.add(best_gt_idx)
         matched_pred.add(best_pred_idx)
         all_ious.append(best_iou)
-    
+
     for i in range(len(gt_masks)):
         if i not in matched_gt:
             all_ious.append(0.0)
-    
+
     tp = sum(1 for iou in all_ious if iou >= iou_threshold)
     fp = len(pred_masks) - len(matched_pred)
     fn = len(gt_masks) - tp
-    
-    mean_iou = np.mean(all_ious) if all_ious else 0.0
-    
-    return float(mean_iou), tp, fp, fn, all_ious
+
+    mean_iou = float(np.mean(all_ious)) if all_ious else 0.0
+
+    return mean_iou, tp, fp, fn, all_ious
 
 
 def count_gt_instances(label_path: str) -> int:
@@ -268,68 +212,6 @@ def count_gt_instances(label_path: str) -> int:
 # ==========================================
 # Drawing helpers
 # ==========================================
-
-def draw_yolo_boxes_custom(
-    image_bgr: np.ndarray,
-    result,
-    show_labels: bool = True,
-    line_width: int = BOX_LINE_WIDTH,
-    font_scale: float = LABEL_FONT_SCALE,
-    font_thickness: int = LABEL_FONT_THICKNESS,
-) -> np.ndarray:
-    out = image_bgr.copy()
-
-    boxes = result.boxes
-    names = result.names if hasattr(result, "names") else {}
-
-    if boxes is None or len(boxes) == 0:
-        return out
-
-    xyxy = boxes.xyxy.cpu().numpy().astype(int)
-    confs = boxes.conf.cpu().numpy() if boxes.conf is not None else np.zeros(len(xyxy))
-    clss = boxes.cls.cpu().numpy().astype(int) if boxes.cls is not None else np.zeros(len(xyxy), dtype=int)
-
-    for box, conf, cls_id in zip(xyxy, confs, clss):
-        x1, y1, x2, y2 = box.tolist()
-        color = (255, 0, 0)  # BGR blue
-
-        cv2.rectangle(out, (x1, y1), (x2, y2), color, line_width)
-
-        if show_labels:
-            cls_name = names.get(cls_id, str(cls_id))
-            label = f"{cls_name} {conf:.2f}" if SHOW_CLASS_NAME else f"{conf:.2f}"
-
-            (tw, th), baseline = cv2.getTextSize(
-                label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, font_thickness
-            )
-
-            text_x = x1 + 4
-            text_y = y1 - 6
-            bg_left = x1
-            bg_top = y1 - th - baseline - 8
-            bg_right = x1 + tw + 8
-            bg_bottom = y1
-
-            if bg_top < 0:
-                bg_top = y1
-                bg_bottom = y1 + th + baseline + 8
-                text_y = y1 + th + 4
-
-            cv2.rectangle(out, (bg_left, bg_top), (bg_right, bg_bottom), color, -1)
-            cv2.putText(
-                out,
-                label,
-                (text_x, text_y),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                font_scale,
-                (255, 255, 255),
-                font_thickness,
-                cv2.LINE_AA,
-            )
-
-    return out
-
-
 def draw_masks_on_top(
     base_bgr: np.ndarray,
     masks: list[np.ndarray],
@@ -355,49 +237,58 @@ def draw_masks_on_top(
     return cv2.addWeighted(overlay, alpha, out, 1 - alpha, 0)
 
 
+def mask_centroid(mask: np.ndarray) -> tuple[int, int] | None:
+    ys, xs = np.where(mask > 0)
+    if len(xs) == 0:
+        return None
+    return int(xs.mean()), int(ys.mean())
+
+
 RED_BGR = (0, 0, 255)
 BLUE_BGR = (255, 0, 0)
 
 
 def compose_layers(
     pil_original: Image.Image,
-    yolo_xyxy: np.ndarray,
-    yolo_confs: np.ndarray,
-    yolo_clss: np.ndarray,
-    yolo_names: dict,
     pred_masks_bin: list[np.ndarray],
-    show_boxes: bool = True,
-    show_labels: bool = True,
     show_masks: bool = True,
+    show_labels: bool = True,
     use_red: bool = False,
 ) -> Image.Image:
+    """Compose the SAM2-only overlay. There are no YOLO boxes to draw, so the
+    only layers are mask outlines and (optionally) numeric labels at each
+    mask centroid.
+    """
     bgr = cv2.cvtColor(np.array(pil_original), cv2.COLOR_RGB2BGR)
-    box_color = RED_BGR
     mask_color = BLUE_BGR if not use_red else RED_BGR
 
     if show_masks and pred_masks_bin:
         bgr = draw_masks_on_top(bgr, pred_masks_bin, alpha=MASK_ALPHA, force_color=mask_color)
 
-    if show_boxes and len(yolo_xyxy) > 0:
-        for box, conf, cls_id in zip(yolo_xyxy, yolo_confs, yolo_clss):
-            x1, y1, x2, y2 = int(box[0]), int(box[1]), int(box[2]), int(box[3])
-            cv2.rectangle(bgr, (x1, y1), (x2, y2), box_color, BOX_LINE_WIDTH)
-
-            if show_labels:
-                cls_name = yolo_names.get(int(cls_id), str(int(cls_id)))
-                lbl = f"{cls_name} {conf:.2f}" if SHOW_CLASS_NAME else f"{conf:.2f}"
-                (tw, th), baseline = cv2.getTextSize(
-                    lbl, cv2.FONT_HERSHEY_SIMPLEX, LABEL_FONT_SCALE, LABEL_FONT_THICKNESS
-                )
-                tx, ty = x1 + 4, y1 - 6
-                bg_l, bg_t = x1, y1 - th - baseline - 8
-                bg_r, bg_b = x1 + tw + 8, y1
-                if bg_t < 0:
-                    bg_t, bg_b = y1, y1 + th + baseline + 8
-                    ty = y1 + th + 4
-                cv2.rectangle(bgr, (bg_l, bg_t), (bg_r, bg_b), box_color, -1)
-                cv2.putText(bgr, lbl, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX,
-                            LABEL_FONT_SCALE, (255, 255, 255), LABEL_FONT_THICKNESS, cv2.LINE_AA)
+    if show_labels and pred_masks_bin:
+        for idx, m in enumerate(pred_masks_bin, start=1):
+            c = mask_centroid(m)
+            if c is None:
+                continue
+            cx, cy = c
+            label = str(idx)
+            (tw, th), baseline = cv2.getTextSize(
+                label, cv2.FONT_HERSHEY_SIMPLEX, LABEL_FONT_SCALE, LABEL_FONT_THICKNESS
+            )
+            bg_l = cx - tw // 2 - 2
+            bg_r = cx + tw // 2 + 2
+            bg_t = cy - th // 2 - baseline - 2
+            bg_b = cy + th // 2 + 2
+            cv2.rectangle(bgr, (bg_l, bg_t), (bg_r, bg_b), mask_color, -1)
+            cv2.putText(
+                bgr, label,
+                (cx - tw // 2, cy + th // 2),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                LABEL_FONT_SCALE,
+                (255, 255, 255),
+                LABEL_FONT_THICKNESS,
+                cv2.LINE_AA,
+            )
 
     return Image.fromarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
 
@@ -405,10 +296,10 @@ def compose_layers(
 # ==========================================
 # MAIN VIEWER
 # ==========================================
-class NativeSAM2YOLOViewer:
+class NativeSAM2OnlyViewer:
     def __init__(self, root):
         self.root = root
-        self.root.title(f"YOLO + SAM2 Segmentation Accuracy | Device: {DEVICE}")
+        self.root.title(f"SAM2-only Baseline | Device: {DEVICE}")
         self.root.geometry("1200x900")
 
         self.image_files = self.get_image_list(SOURCE_PATHS)
@@ -416,7 +307,6 @@ class NativeSAM2YOLOViewer:
         self.current_idx = 0
         self.is_processing = True
         self.progress_val = 0.0
-        self.show_yolo = True
         self.show_sam2 = True
         self.show_labels = True
         self.use_red = False
@@ -454,11 +344,6 @@ class NativeSAM2YOLOViewer:
             self.is_processing = False
             return
 
-        if not os.path.exists(YOLO_MODEL_PATH):
-            self.lbl_status.config(text=f"❌ MISSING YOLO WEIGHTS: {YOLO_MODEL_PATH}")
-            self.is_processing = False
-            return
-
         if not os.path.exists(SAM2_CHECKPOINT):
             self.lbl_status.config(text=f"❌ MISSING SAM2 WEIGHTS: {SAM2_CHECKPOINT}")
             self.is_processing = False
@@ -475,7 +360,7 @@ class NativeSAM2YOLOViewer:
         frame_top = tk.Frame(self.root, pady=5)
         frame_top.pack(side=tk.TOP, fill=tk.X)
 
-        self.lbl_status = tk.Label(frame_top, text="Loading Models...", font=("Arial", 12, "bold"))
+        self.lbl_status = tk.Label(frame_top, text="Loading SAM2...", font=("Arial", 12, "bold"))
         self.lbl_status.pack()
 
         self.lbl_accuracy = tk.Label(frame_top, text="Accuracy: --", font=("Arial", 11))
@@ -548,12 +433,6 @@ class NativeSAM2YOLOViewer:
         )
         self.btn_toggle_sam2.pack(side=tk.RIGHT, padx=4)
 
-        self.btn_toggle_yolo = tk.Button(
-            frame_bot, text="Toggle YOLO",
-            command=self.toggle_yolo, width=14,
-        )
-        self.btn_toggle_yolo.pack(side=tk.RIGHT, padx=4)
-
     def bind_navigation_events(self):
         self.root.bind("<Configure>", self.on_window_resize)
 
@@ -574,7 +453,7 @@ class NativeSAM2YOLOViewer:
 
         # reliable keyboard zoom fallback
         self.root.bind("<KeyPress-plus>", self.zoom_in_key)
-        self.root.bind("<KeyPress-equal>", self.zoom_in_key)      # handles '+' on many keyboards
+        self.root.bind("<KeyPress-equal>", self.zoom_in_key)
         self.root.bind("<KeyPress-minus>", self.zoom_out_key)
         self.root.bind("<KeyPress-underscore>", self.zoom_out_key)
         self.root.bind("<KeyPress-0>", self.reset_zoom_key)
@@ -592,9 +471,9 @@ class NativeSAM2YOLOViewer:
     # -------------------------
     def get_image_list(self, source_paths_str):
         image_paths = []
-        
+
         paths = [p.strip() for p in source_paths_str.split(",") if p.strip()]
-        
+
         for dataset_root in paths:
             if os.path.isfile(dataset_root):
                 if dataset_root.lower().endswith(VALID_EXTS):
@@ -617,16 +496,13 @@ class NativeSAM2YOLOViewer:
         if not self.processed_results:
             return None
         data = self.processed_results[self.current_idx]
-        if not self.show_yolo and not self.show_sam2 and not self.show_labels:
+        if not self.show_sam2 and not self.show_labels:
             return data["image_original"]
         return compose_layers(
             data["image_original"],
-            data["yolo_xyxy"], data["yolo_confs"],
-            data["yolo_clss"], data["yolo_names"],
             data["pred_masks_bin"],
-            show_boxes=self.show_yolo,
-            show_labels=self.show_labels,
             show_masks=self.show_sam2,
+            show_labels=self.show_labels,
             use_red=self.use_red,
         )
 
@@ -687,7 +563,6 @@ class NativeSAM2YOLOViewer:
 
     def is_zoom_modifier_active(self, event) -> bool:
         state = getattr(event, "state", 0)
-        # command / control depending on platform + tkinter bit behavior
         return bool(state & 0x0004) or bool(state & 0x0008) or bool(state & 0x0010)
 
     def zoom_about_point(self, zoom_in: bool, canvas_x: float, canvas_y: float):
@@ -712,7 +587,6 @@ class NativeSAM2YOLOViewer:
 
         new_scale = self.get_effective_scale(img_w, img_h, canvas_w, canvas_h)
 
-        # keep the pixel under the cursor fixed during zoom
         img_x = (canvas_x - self.pan_x) / old_scale
         img_y = (canvas_y - self.pan_y) / old_scale
 
@@ -725,9 +599,12 @@ class NativeSAM2YOLOViewer:
         if not self.processed_results:
             return
 
-        # zoom with Command/Ctrl + scroll, otherwise pan vertically
         if self.is_zoom_modifier_active(event):
-            self.zoom_about_point(event.delta > 0, event.x_root - self.canvas.winfo_rootx(), event.y_root - self.canvas.winfo_rooty())
+            self.zoom_about_point(
+                event.delta > 0,
+                event.x_root - self.canvas.winfo_rootx(),
+                event.y_root - self.canvas.winfo_rooty(),
+            )
         else:
             step = 45 if event.delta > 0 else -45
             self.pan_y += step
@@ -779,13 +656,17 @@ class NativeSAM2YOLOViewer:
     # -------------------------
     def run_pipeline(self):
         try:
-            print(f"Loading YOLO: {YOLO_MODEL_PATH}")
-            yolo = YOLO(YOLO_MODEL_PATH)
-
             print(f"Loading Native SAM2: {SAM2_CHECKPOINT}")
             sam2_model = build_sam2(SAM2_CONFIG_NAME, SAM2_CHECKPOINT, device=DEVICE)
-            predictor = SAM2ImagePredictor(sam2_model)
-
+            mask_generator = SAM2AutomaticMaskGenerator(
+                model=sam2_model,
+                points_per_side=SAM2_POINTS_PER_SIDE,
+                pred_iou_thresh=SAM2_PRED_IOU_THRESH,
+                stability_score_thresh=SAM2_STABILITY_SCORE_THRESH,
+                box_nms_thresh=SAM2_BOX_NMS_THRESH,
+                crop_n_layers=SAM2_CROP_N_LAYERS,
+                min_mask_region_area=SAM2_MIN_MASK_REGION_AREA,
+            )
         except Exception as e:
             print(f"MODEL LOAD ERROR: {e}")
             self.lbl_status.config(text=f"Error: {e}")
@@ -801,82 +682,38 @@ class NativeSAM2YOLOViewer:
 
             img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
             h, w = img_bgr.shape[:2]
-
-            results = yolo.predict(
-                source=img_path,
-                conf=CONFIDENCE,
-                iou=IOU_THRESH,
-                imgsz=IMG_SIZE,
-                verbose=False,
-                agnostic_nms=True,
-                augment=True,
-                max_det=1000,
-            )
-            r0 = results[0]
+            img_area = h * w
+            max_area = POST_MAX_AREA_FRAC * img_area
 
             lbl_path = label_for_image(img_path)
             gt_count = count_gt_instances(lbl_path)
-
-            # Parse GT segmentation masks
             gt_masks = parse_yolo_seg_labels(lbl_path, w, h)
 
-            if len(r0.boxes) > 0:
-                all_xyxy = r0.boxes.xyxy.cpu().numpy().astype(np.float32)
-                all_confs = (
-                    r0.boxes.conf.cpu().numpy()
-                    if r0.boxes.conf is not None
-                    else np.zeros(len(all_xyxy), dtype=np.float32)
-                )
-                all_clss = (
-                    r0.boxes.cls.cpu().numpy().astype(int)
-                    if r0.boxes.cls is not None
-                    else np.zeros(len(all_xyxy), dtype=int)
-                )
+            try:
+                raw = mask_generator.generate(img_rgb)
+            except Exception as e:
+                print(f"  SAM2 generate error on {os.path.basename(img_path)}: {e}")
+                raw = []
 
-                if ENABLE_CLUSTER_SUPPRESSION:
-                    keep_idx = suppress_cluster_boxes(all_xyxy)
-                    n_dropped = len(all_xyxy) - len(keep_idx)
-                    if n_dropped > 0:
-                        print(
-                            f"  cluster suppression dropped {n_dropped} "
-                            f"box(es) wrapping >= {CLUSTER_MIN_CHILDREN} smaller box(es)"
-                        )
-                else:
-                    keep_idx = np.arange(len(all_xyxy), dtype=int)
+            kept_masks: list[np.ndarray] = []
+            for ann in raw:
+                m = ann.get("segmentation")
+                if m is None:
+                    continue
+                m_bin = m.astype(np.uint8) if m.dtype != np.uint8 else m
+                area = int(m_bin.sum())
+                if area < POST_MIN_AREA_PX:
+                    continue
+                if area > max_area:
+                    continue
+                kept_masks.append(m_bin)
 
-                boxes = all_xyxy[keep_idx]
-                confs = all_confs[keep_idx]
-                clss = all_clss[keep_idx]
-            else:
-                boxes = np.empty((0, 4), dtype=np.float32)
-                confs = np.empty((0,), dtype=np.float32)
-                clss = np.empty((0,), dtype=int)
+            pred_count = len(kept_masks)
 
-            pred_count = len(boxes)
-
-            pred_masks = []
-            if len(boxes) > 0:
-                predictor.set_image(img_rgb)
-
-                for b in boxes:
-                    m, scores, _ = predictor.predict(
-                        point_coords=None,
-                        point_labels=None,
-                        box=b[None, :],
-                        multimask_output=False
-                    )
-
-                    m0 = m[0]
-                    if m0.ndim == 3:
-                        m0 = m0.squeeze(0)
-                    pred_masks.append(m0)
-
-            # Compute segmentation accuracy (mask IoU)
             mean_iou, tp, fp, fn, _ = match_masks_and_compute_accuracy(
-                pred_masks, gt_masks, iou_threshold=IOU_THRESH
+                kept_masks, gt_masks, iou_threshold=IOU_THRESH
             )
-            
-            # Update totals
+
             self.total_gt += gt_count
             self.total_pred += pred_count
             self.total_tp += tp
@@ -886,12 +723,6 @@ class NativeSAM2YOLOViewer:
             self.n_imgs += 1
 
             pil_img_original = Image.fromarray(img_rgb)
-
-            yolo_xyxy = boxes.astype(int) if len(boxes) > 0 else np.empty((0, 4), dtype=int)
-            yolo_confs = confs if len(boxes) > 0 else np.array([])
-            yolo_clss = clss if len(boxes) > 0 else np.array([], dtype=int)
-            yolo_names = r0.names if hasattr(r0, "names") else {}
-            pred_masks_bin = [(m > MASK_THRESH).astype(np.uint8) for m in pred_masks]
 
             self.processed_results.append({
                 "image_original": pil_img_original,
@@ -904,17 +735,14 @@ class NativeSAM2YOLOViewer:
                 "fn": fn,
                 "label_path": lbl_path,
                 "src_path": img_path,
-                "yolo_xyxy": yolo_xyxy,
-                "yolo_confs": yolo_confs,
-                "yolo_clss": yolo_clss,
-                "yolo_names": yolo_names,
-                "pred_masks_bin": pred_masks_bin,
+                "pred_masks_bin": kept_masks,
             })
 
             self.progress_val = (i + 1) / total * 100.0
             print(
                 f"[{i + 1}/{total}] {os.path.basename(img_path)}: "
-                f"YOLO detected {pred_count} microplastics (GT: {gt_count})"
+                f"SAM2 produced {len(raw)} raw masks -> {pred_count} kept "
+                f"(GT: {gt_count})"
             )
 
         self.is_processing = False
@@ -943,17 +771,18 @@ class NativeSAM2YOLOViewer:
         if is_new_file:
             wb = openpyxl.Workbook()
             ws = wb.active
-            # Match the existing Counting.xlsx layout: header row at row 2,
-            # image names in column B, "Counted # by v3" in column G.
+            # Match the layout of the existing Counting.xlsx: header row at
+            # row 2, image names in column B, "Counted # by SAM2 only" in H.
             ws["B2"] = COUNTING_IMAGE_NAME_HEADER
             ws["C2"] = "PS size (um)"
             ws["D2"] = "Conc. (mgL)"
             ws["E2"] = "Counted # by algorithm"
             ws["F2"] = "Counted # by human"
-            ws["G2"] = COUNTING_V3_HEADER
+            ws["G2"] = "Counted # by v3"
+            ws["H2"] = COUNTING_SAM2_HEADER
             header_row = 2
             name_col = 2  # B
-            v3_col = 7    # G
+            sam2_col = 8  # H
         else:
             wb = openpyxl.load_workbook(xlsx_path)
             ws = wb.active
@@ -970,25 +799,29 @@ class NativeSAM2YOLOViewer:
             name_col = self._find_column_for_header(
                 ws, header_row, COUNTING_IMAGE_NAME_HEADER
             )
-            v3_col = self._find_column_for_header(
-                ws, header_row, COUNTING_V3_HEADER
+            sam2_col = self._find_column_for_header(
+                ws, header_row, COUNTING_SAM2_HEADER
             )
-            if name_col < 0 or v3_col < 0:
-                msg = (
-                    f"Export Counts: header(s) not found in row {header_row} "
-                    f"(name={name_col}, v3={v3_col})"
-                )
+            if name_col < 0:
+                msg = f"Export Counts: '{COUNTING_IMAGE_NAME_HEADER}' column not found in row {header_row}."
                 print(msg)
                 self.lbl_export.config(text=msg)
                 return
 
-        # Build a strict basename -> row map from the spreadsheet so that
-        # each image is matched to its own row by exact name (case-sensitive,
-        # whitespace-trimmed). Duplicates: first occurrence wins. We also
-        # track the last row that actually has an image name so any appended
-        # rows land directly under the data instead of after openpyxl's
-        # styled/used-range tail (which can extend hundreds of rows past the
-        # last real row).
+            if sam2_col < 0:
+                # Header for the SAM2-only column doesn't exist yet -- create
+                # it in column H (preferred) or, if H is occupied by another
+                # header, in the first empty header cell after the image-name
+                # column.
+                preferred = 8  # H
+                target = preferred
+                existing = ws.cell(row=header_row, column=preferred).value
+                if existing is not None and str(existing).strip() != "":
+                    target = ws.max_column + 1
+                ws.cell(row=header_row, column=target, value=COUNTING_SAM2_HEADER)
+                sam2_col = target
+
+        # Build a strict basename -> row map.
         name_to_row: dict[str, int] = {}
         last_data_row = header_row
         for r in range(header_row + 1, ws.max_row + 1):
@@ -1011,19 +844,19 @@ class NativeSAM2YOLOViewer:
             target_row = name_to_row.get(image_name)
             if target_row is None:
                 ws.cell(row=next_row, column=name_col, value=image_name)
-                ws.cell(row=next_row, column=v3_col, value=data["pred_count"])
+                ws.cell(row=next_row, column=sam2_col, value=data["pred_count"])
                 name_to_row[image_name] = next_row
                 next_row += 1
                 appended += 1
             else:
-                ws.cell(row=target_row, column=v3_col, value=data["pred_count"])
+                ws.cell(row=target_row, column=sam2_col, value=data["pred_count"])
                 written += 1
 
         wb.save(xlsx_path)
 
-        col_letter = openpyxl.utils.get_column_letter(v3_col)
+        col_letter = openpyxl.utils.get_column_letter(sam2_col)
         msg = (
-            f"Exported {written} count(s) to '{COUNTING_V3_HEADER}' "
+            f"Exported {written} count(s) to '{COUNTING_SAM2_HEADER}' "
             f"(col {col_letter})"
         )
         if appended:
@@ -1033,9 +866,6 @@ class NativeSAM2YOLOViewer:
 
     @staticmethod
     def _find_header_row(ws, image_name_header: str) -> int:
-        """Locate the row containing the image-name header. Searches the first
-        ~20 rows so headers in row 1 or row 2 both work.
-        """
         for row in ws.iter_rows(
             min_row=1, max_row=min(ws.max_row, 20), values_only=False
         ):
@@ -1060,7 +890,7 @@ class NativeSAM2YOLOViewer:
         base_name = os.path.basename(first_path)
 
         suffix = "_".join(layer_parts) if layer_parts else "original"
-        folder_name = f"{base_name}_{suffix}"
+        folder_name = f"{base_name}_sam2only_{suffix}"
 
         export_dir = os.path.join(parent_dir, folder_name)
         os.makedirs(export_dir, exist_ok=True)
@@ -1079,7 +909,7 @@ class NativeSAM2YOLOViewer:
     def _show_export_dialog(self):
         dialog = tk.Toplevel(self.root)
         dialog.title("Export Options")
-        dialog.geometry("320x300")
+        dialog.geometry("320x260")
         dialog.resizable(False, False)
         dialog.transient(self.root)
         dialog.grab_set()
@@ -1089,19 +919,16 @@ class NativeSAM2YOLOViewer:
             font=("Arial", 12, "bold")
         ).pack(pady=(18, 12))
 
-        var_boxes = tk.BooleanVar(value=True)
-        var_labels = tk.BooleanVar(value=True)
         var_masks = tk.BooleanVar(value=True)
+        var_labels = tk.BooleanVar(value=True)
         var_red = tk.BooleanVar(value=self.use_red)
 
         opts_frame = tk.Frame(dialog)
         opts_frame.pack(anchor="w", padx=40)
 
-        tk.Checkbutton(opts_frame, text="YOLO Boxes", variable=var_boxes,
-                        font=("Arial", 11)).pack(anchor="w", pady=2)
-        tk.Checkbutton(opts_frame, text="YOLO Labels", variable=var_labels,
-                        font=("Arial", 11)).pack(anchor="w", pady=2)
         tk.Checkbutton(opts_frame, text="SAM2 Masks", variable=var_masks,
+                        font=("Arial", 11)).pack(anchor="w", pady=2)
+        tk.Checkbutton(opts_frame, text="Mask Numbers", variable=var_labels,
                         font=("Arial", 11)).pack(anchor="w", pady=2)
         tk.Checkbutton(opts_frame, text="Red Color", variable=var_red,
                         font=("Arial", 11)).pack(anchor="w", pady=2)
@@ -1111,7 +938,7 @@ class NativeSAM2YOLOViewer:
 
         def on_export():
             dialog.destroy()
-            self._run_export(var_boxes.get(), var_labels.get(), var_masks.get(), var_red.get())
+            self._run_export(var_masks.get(), var_labels.get(), var_red.get())
 
         def on_cancel():
             dialog.destroy()
@@ -1119,14 +946,12 @@ class NativeSAM2YOLOViewer:
         tk.Button(btn_frame, text="Cancel", command=on_cancel, width=10).pack(side=tk.LEFT, padx=10)
         tk.Button(btn_frame, text="Export", command=on_export, width=10).pack(side=tk.LEFT, padx=10)
 
-    def _run_export(self, show_boxes, show_labels, show_masks, use_red):
+    def _run_export(self, show_masks, show_labels, use_red):
         parts = []
-        if show_boxes:
-            parts.append("yolo")
-        if show_labels:
-            parts.append("labels")
         if show_masks:
             parts.append("sam2")
+        if show_labels:
+            parts.append("labels")
         if use_red:
             parts.append("red")
 
@@ -1137,24 +962,21 @@ class NativeSAM2YOLOViewer:
         self.btn_export.config(state=tk.DISABLED)
         self.lbl_export.config(text=f"Export: writing to {self.export_dir}")
 
-        self._export_options = (show_boxes, show_labels, show_masks, use_red)
+        self._export_options = (show_masks, show_labels, use_red)
         self.export_thread = threading.Thread(target=self._export_worker, daemon=True)
         self.export_thread.start()
         self._poll_export_done()
 
     def _export_worker(self):
-        show_boxes, show_labels, show_masks, use_red = self._export_options
+        show_masks, show_labels, use_red = self._export_options
         results_snapshot = list(self.processed_results)
 
         for idx, item in enumerate(results_snapshot, start=1):
             img = compose_layers(
                 item["image_original"],
-                item["yolo_xyxy"], item["yolo_confs"],
-                item["yolo_clss"], item["yolo_names"],
                 item["pred_masks_bin"],
-                show_boxes=show_boxes,
-                show_labels=show_labels,
                 show_masks=show_masks,
+                show_labels=show_labels,
                 use_red=use_red,
             )
 
@@ -1260,8 +1082,8 @@ class NativeSAM2YOLOViewer:
 
         iou_str = f"{mean_iou * 100:.1f}%" if mean_iou is not None else "--"
         self.root.title(
-            f"YOLO+SAM2 Seg | {data['filename']} | IoU: {iou_str} | Pred/GT: {pred}/{gt} "
-            f"| YOLO: {'ON' if self.show_yolo else 'OFF'} | SAM2: {'ON' if self.show_sam2 else 'OFF'} "
+            f"SAM2-only Seg | {data['filename']} | IoU: {iou_str} | Pred/GT: {pred}/{gt} "
+            f"| SAM2: {'ON' if self.show_sam2 else 'OFF'} "
             f"| Labels: {'ON' if self.show_labels else 'OFF'} | Zoom: {self.user_zoom:.2f}x"
         )
 
@@ -1270,10 +1092,6 @@ class NativeSAM2YOLOViewer:
         state_next = tk.NORMAL if self.current_idx < len(self.processed_results) - 1 else tk.DISABLED
         self.btn_prev.config(state=state_prev)
         self.btn_next.config(state=state_next)
-
-    def toggle_yolo(self):
-        self.show_yolo = not self.show_yolo
-        self.update_display()
 
     def toggle_sam2(self):
         self.show_sam2 = not self.show_sam2
@@ -1305,6 +1123,5 @@ class NativeSAM2YOLOViewer:
 
 if __name__ == "__main__":
     root = tk.Tk()
-    app = NativeSAM2YOLOViewer(root)
+    app = NativeSAM2OnlyViewer(root)
     root.mainloop()
-    
