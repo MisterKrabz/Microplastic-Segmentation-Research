@@ -28,18 +28,18 @@ from sam2.sam2_image_predictor import SAM2ImagePredictor
 # ==========================================
 # CONFIGURATION
 # ==========================================
-DATASET_DIR = "./../../datasets/ImagesWithPredictedChemicalMap"
-YOLO_MODEL_PATH = "./../../models/hunter-yolo-v0.4.4.pt"
+DATASET_DIR = "./../../datasets/testing_datasets/Overlay"
+YOLO_MODEL_PATH = "./../../models/hunter-yolo-v0.5.4/hunter-yolo-v0.5.4.pt"
 
 SAM2_CHECKPOINT = "./../../models/sam2.1_hiera_large.pt"
 SAM2_CONFIG_NAME = "configs/sam2.1/sam2.1_hiera_l.yaml"
 
-CONFIDENCE = 0.1
-IOU_THRESH = 0.25
-IMG_SIZE = 1280
+CONFIDENCE = 0.2
+IOU_THRESH = .7
+IMG_SIZE = 1536
 
-BOX_LINE_WIDTH = 2
-LABEL_FONT_SCALE = 0.45
+BOX_LINE_WIDTH = 1
+LABEL_FONT_SCALE = 0.30
 LABEL_FONT_THICKNESS = 1
 
 DEVICE = (
@@ -48,7 +48,7 @@ DEVICE = (
     else "cpu"
 )
 
-BOX_SHRINK = 0.10
+BOX_SHRINK = 0.0
 MASK_THRESH = 0.5
 MASK_ALPHA = 0.45
 
@@ -57,13 +57,15 @@ MIN_USER_ZOOM = 0.20
 MAX_USER_ZOOM = 12.0
 
 MATERIAL_COLORS = {
-    "Polystyrene":              (0, 180, 180),
-    "Polymethyl Methacrylate":  (0, 140, 255),
-    "Polyethylene":             (180, 0, 180),
+    "Polystyrene":              (0, 192, 255),    # #ffc000
+    "Polymethyl Methacrylate":  (141, 139, 15),   # #0f8b8d
+    "Polyethylene":             (49, 125, 237),    # #ed7d31
     "Cotton":                   (80, 200, 80),
     "NA":                       (128, 128, 128),
 }
 DEFAULT_COLOR = (200, 200, 200)
+RED_BGR  = (0, 0, 255)
+BLUE_BGR = (255, 0, 0)
 
 
 # ==========================================
@@ -76,27 +78,72 @@ def load_chemical_map(csv_path: str) -> list[list[str]]:
         return [row for row in reader]
 
 
+_NA_VARIANTS = {"na", "n/a", "nan", "none", "unknown", ""}
+_LOW_PRIORITY_VARIANTS = {"polycarbonate"}
+
+HIGH_PRIORITY_MULTIPLIER = 3
+
+
+def _is_na(material: str) -> bool:
+    """True for any string that represents an undefined / missing chemical."""
+    return material.strip().lower() in _NA_VARIANTS
+
+
+def _is_low_priority(material: str) -> bool:
+    """True for NA-like or substrate materials (e.g. Polycarbonate)."""
+    s = material.strip().lower()
+    return s in _NA_VARIANTS or s in _LOW_PRIORITY_VARIANTS
+
+
 def classify_mask(mask, chem_grid, img_h, img_w):
+    """Determine the single definitive material for a SAM2 mask by weighted
+    pixel-area vote against the CNN chemical map grid.
+
+    Priority scoring
+    ────────────────
+    1. Count how many mask pixels fall on each material in the chemical grid.
+    2. Low-priority materials (NA, Polycarbonate) keep their raw pixel count
+       as the score.
+    3. High-priority materials (all other real chemicals) have their pixel
+       count multiplied by HIGH_PRIORITY_MULTIPLIER (3×).
+    4. The material with the highest final score wins.
+    """
     n_rows = len(chem_grid)
     n_cols = len(chem_grid[0]) if n_rows else 0
     if n_rows == 0 or n_cols == 0:
-        return "Unknown", {}
+        return "NA", {}
+
     cell_h, cell_w = img_h / n_rows, img_w / n_cols
     mask_bin = (mask > MASK_THRESH).astype(np.uint8) if mask.dtype != np.uint8 else mask
     ys, xs = np.where(mask_bin > 0)
     if len(ys) == 0:
-        return "Unknown", {}
+        return "NA", {}
+
     grid_rows = np.clip((ys / cell_h).astype(int), 0, n_rows - 1)
     grid_cols = np.clip((xs / cell_w).astype(int), 0, n_cols - 1)
-    cells = set(zip(grid_rows.tolist(), grid_cols.tolist()))
-    votes: Counter = Counter()
-    for r, c in cells:
-        mat = chem_grid[r][c].strip() if c < len(chem_grid[r]) else "NA"
-        if mat and mat != "NA":
-            votes[mat] += 1
-    if not votes:
-        return "NA", {"NA": len(cells)}
-    return votes.most_common(1)[0][0], dict(votes)
+
+    unique_cells, cell_pixel_counts = np.unique(
+        np.stack([grid_rows, grid_cols], axis=1), axis=0, return_counts=True
+    )
+
+    pixel_votes: Counter = Counter()
+    for (r, c), count in zip(unique_cells.tolist(), cell_pixel_counts.tolist()):
+        raw = chem_grid[r][c].strip() if c < len(chem_grid[r]) else ""
+        label = "NA" if _is_na(raw) else raw
+        pixel_votes[label] += count
+
+    if not pixel_votes:
+        return "NA", {}
+
+    weighted_scores = {}
+    for material, area in pixel_votes.items():
+        if _is_low_priority(material):
+            weighted_scores[material] = area
+        else:
+            weighted_scores[material] = area * HIGH_PRIORITY_MULTIPLIER
+
+    winner = max(weighted_scores, key=weighted_scores.get)
+    return winner, dict(pixel_votes)
 
 
 def color_for_material(material):
@@ -112,18 +159,38 @@ def find_image_csv_pairs(dataset_dir):
     for f in files:
         full = os.path.join(dataset_dir, f)
         if f.endswith("_modified.jpg") or f.endswith("_modified.png"):
-            m = re.search(r"__(\d+)_modified\.", f)
-            if m:
-                images[m.group(1)] = full
+            # key = full stem before "_modified.*" — unique across different series
+            key = re.sub(r"_modified\.(jpg|png)$", "", f, flags=re.IGNORECASE)
+            images[key] = full
         elif f.endswith("_predictedMap_cnn_aug.csv"):
-            m = re.search(r"__(\d+)_Raw_predictedMap", f)
-            if m:
-                csvs[m.group(1)] = full
+            key = re.sub(r"_Raw_predictedMap_cnn_aug\.csv$", "", f, flags=re.IGNORECASE)
+            csvs[key] = full
     pairs = []
-    for idx in sorted(images):
-        if idx in csvs:
-            pairs.append({"image_path": images[idx], "csv_path": csvs[idx], "index": idx})
+    for key in sorted(images):
+        if key in csvs:
+            pairs.append({"image_path": images[key], "csv_path": csvs[key], "index": key})
     return pairs
+
+
+def render_chemical_map_image(chem_grid, img_h, img_w):
+    """Render the CNN-predicted chemical map as a BGR image sized to the original."""
+    n_rows = len(chem_grid)
+    n_cols = len(chem_grid[0]) if n_rows else 0
+    if n_rows == 0 or n_cols == 0:
+        return np.zeros((img_h, img_w, 3), dtype=np.uint8)
+    cell_h = img_h / n_rows
+    cell_w = img_w / n_cols
+    img = np.zeros((img_h, img_w, 3), dtype=np.uint8)
+    for r in range(n_rows):
+        for c in range(n_cols):
+            mat = chem_grid[r][c].strip() if c < len(chem_grid[r]) else "NA"
+            color = color_for_material(mat)
+            y1 = int(r * cell_h)
+            y2 = int((r + 1) * cell_h)
+            x1 = int(c * cell_w)
+            x2 = int((c + 1) * cell_w)
+            img[y1:y2, x1:x2] = color
+    return img
 
 
 def shrink_box(box_xyxy, w, h, frac):
@@ -156,6 +223,7 @@ def compose_image(
     show_yolo: bool = True,
     show_sam2: bool = True,
     show_labels: bool = True,
+    use_material_colors: bool = True,
     hover_idx: int = -1,
     alpha: float = MASK_ALPHA,
 ) -> np.ndarray:
@@ -172,7 +240,7 @@ def compose_image(
         mask_bin = (mask > MASK_THRESH).astype(np.uint8) * 255
         if mask_bin.sum() == 0:
             continue
-        color = color_for_material(material)
+        color = color_for_material(material) if use_material_colors else BLUE_BGR
         contours, _ = cv2.findContours(mask_bin, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         cv2.drawContours(overlay, contours, -1, color, -1)
         cv2.drawContours(out, contours, -1, color, 2)
@@ -181,7 +249,7 @@ def compose_image(
 
     for i in range(min(len(materials), len(boxes_xyxy))):
         material = materials[i]
-        color = color_for_material(material)
+        color = color_for_material(material) if use_material_colors else RED_BGR
         x1, y1, x2, y2 = boxes_xyxy[i].astype(int)
         conf = confidences[i] if i < len(confidences) else 0.0
 
@@ -229,6 +297,8 @@ class ChemicalIdentificationViewer:
         self.show_yolo = True
         self.show_sam2 = True
         self.show_labels = True
+        self.use_material_colors = True
+        self.use_chem_bg = False
         self.hover_idx = -1
 
         self.is_exporting = False
@@ -303,6 +373,12 @@ class ChemicalIdentificationViewer:
         self.btn_labels = tk.Button(frame_bot, text="Toggle Labels", command=self.toggle_labels, width=12)
         self.btn_labels.pack(side=tk.LEFT, padx=4)
 
+        self.btn_colors = tk.Button(frame_bot, text="Toggle Colors", command=self.toggle_colors, width=12)
+        self.btn_colors.pack(side=tk.LEFT, padx=4)
+
+        self.btn_background = tk.Button(frame_bot, text="Toggle Background", command=self.toggle_background, width=16)
+        self.btn_background.pack(side=tk.LEFT, padx=4)
+
         self.btn_next = tk.Button(frame_bot, text="Next >>", command=self.next_img, state=tk.DISABLED, width=10)
         self.btn_next.pack(side=tk.RIGHT, padx=6)
 
@@ -339,7 +415,8 @@ class ChemicalIdentificationViewer:
     # Compositing
     # -----------------------------------------------
     def _cache_compose_key(self):
-        return (self.current_idx, self.show_yolo, self.show_sam2, self.show_labels, self.hover_idx)
+        return (self.current_idx, self.show_yolo, self.show_sam2, self.show_labels,
+                self.use_material_colors, self.use_chem_bg, self.hover_idx)
 
     def get_current_pil_image(self):
         if not self.processed_results:
@@ -350,8 +427,9 @@ class ChemicalIdentificationViewer:
             return self._cached_pil
 
         data = self.processed_results[self.current_idx]
+        base_img = data["chem_map_bgr"] if self.use_chem_bg else data["image_bgr"]
         bgr = compose_image(
-            data["image_bgr"],
+            base_img,
             data["masks"],
             data["materials"],
             data["boxes_xyxy"],
@@ -359,6 +437,7 @@ class ChemicalIdentificationViewer:
             show_yolo=self.show_yolo,
             show_sam2=self.show_sam2,
             show_labels=self.show_labels,
+            use_material_colors=self.use_material_colors,
             hover_idx=self.hover_idx,
         )
         pil = Image.fromarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
@@ -578,7 +657,8 @@ class ChemicalIdentificationViewer:
 
             results = yolo.predict(
                 source=img_path, conf=CONFIDENCE, iou=IOU_THRESH,
-                imgsz=IMG_SIZE, verbose=False, agnostic_nms=True,
+                imgsz=IMG_SIZE, verbose=False, 
+                agnostic_nms=False,
             )
             r0 = results[0]
             boxes = r0.boxes.xyxy.cpu().numpy().astype(np.float32) if len(r0.boxes) > 0 else np.empty((0, 4), dtype=np.float32)
@@ -602,8 +682,11 @@ class ChemicalIdentificationViewer:
                     mat, _ = classify_mask(m0, chem_grid, h, w)
                     materials.append(mat)
 
+            chem_map_bgr = render_chemical_map_image(chem_grid, h, w)
+
             self.processed_results.append({
                 "image_bgr": img_bgr,
+                "chem_map_bgr": chem_map_bgr,
                 "masks": pred_masks,
                 "boxes_xyxy": boxes,
                 "confidences": confs,
@@ -698,6 +781,18 @@ class ChemicalIdentificationViewer:
         self.invalidate_cache()
         self.update_display()
 
+    def toggle_colors(self):
+        self.use_material_colors = not self.use_material_colors
+        self._update_toggle_btn(self.btn_colors, "Colors", self.use_material_colors)
+        self.invalidate_cache()
+        self.update_display()
+
+    def toggle_background(self):
+        self.use_chem_bg = not self.use_chem_bg
+        self._update_toggle_btn(self.btn_background, "Background", self.use_chem_bg)
+        self.invalidate_cache()
+        self.update_display()
+
     # -----------------------------------------------
     # Navigation
     # -----------------------------------------------
@@ -723,47 +818,116 @@ class ChemicalIdentificationViewer:
     def export_all(self):
         if self.is_exporting or not self.processed_results:
             return
+        self._show_export_dialog()
+
+    def _show_export_dialog(self):
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Export Options")
+        dialog.geometry("320x320")
+        dialog.resizable(False, False)
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        tk.Label(
+            dialog, text="Select layers to include:",
+            font=("Arial", 12, "bold")
+        ).pack(pady=(18, 12))
+
+        var_boxes  = tk.BooleanVar(value=self.show_yolo)
+        var_masks  = tk.BooleanVar(value=self.show_sam2)
+        var_labels = tk.BooleanVar(value=self.show_labels)
+        var_colors = tk.BooleanVar(value=self.use_material_colors)
+        var_chem   = tk.BooleanVar(value=self.use_chem_bg)
+
+        opts_frame = tk.Frame(dialog)
+        opts_frame.pack(anchor="w", padx=40)
+
+        tk.Checkbutton(opts_frame, text="YOLO Boxes",          variable=var_boxes,  font=("Arial", 11)).pack(anchor="w", pady=2)
+        tk.Checkbutton(opts_frame, text="SAM2 Masks",          variable=var_masks,  font=("Arial", 11)).pack(anchor="w", pady=2)
+        tk.Checkbutton(opts_frame, text="Labels",              variable=var_labels, font=("Arial", 11)).pack(anchor="w", pady=2)
+        tk.Checkbutton(opts_frame, text="Material Colors",     variable=var_colors, font=("Arial", 11)).pack(anchor="w", pady=2)
+        tk.Checkbutton(opts_frame, text="Chemical Background", variable=var_chem,   font=("Arial", 11)).pack(anchor="w", pady=2)
+
+        btn_frame = tk.Frame(dialog)
+        btn_frame.pack(pady=20)
+
+        def on_export():
+            dialog.destroy()
+            self._run_export(
+                var_boxes.get(), var_masks.get(), var_labels.get(),
+                var_colors.get(), var_chem.get(),
+            )
+
+        def on_cancel():
+            dialog.destroy()
+
+        tk.Button(btn_frame, text="Cancel", command=on_cancel, width=10).pack(side=tk.LEFT, padx=10)
+        tk.Button(btn_frame, text="Export", command=on_export, width=10).pack(side=tk.LEFT, padx=10)
+
+    def make_export_dir(self, layer_parts: list[str]) -> str:
+        first_path = os.path.normpath(DATASET_DIR)
+        parent_dir = os.path.dirname(first_path)
+        base_name = os.path.basename(first_path)
+
+        suffix = "_".join(layer_parts) if layer_parts else "original"
+        folder_name = f"{base_name}_{suffix}"
+
+        export_dir = os.path.join(parent_dir, folder_name)
+        os.makedirs(export_dir, exist_ok=True)
+        return export_dir
+
+    def _run_export(self, show_boxes, show_masks, show_labels, use_material_colors, use_chem_bg):
+        parts = []
+        if show_boxes:
+            parts.append("yolo")
+        if show_masks:
+            parts.append("sam2")
+        if show_labels:
+            parts.append("labels")
+        if use_material_colors:
+            parts.append("colors")
+        if use_chem_bg:
+            parts.append("chemBG")
+
+        self._export_options = (show_boxes, show_masks, show_labels, use_material_colors, use_chem_bg)
+        self._export_dir = self.make_export_dir(parts)
         self.is_exporting = True
         self._export_done = False
         self._export_progress = (0, len(self.processed_results))
         self.btn_export.config(state=tk.DISABLED)
-        self.lbl_export.config(text="Exporting...")
+        self.lbl_export.config(text=f"Export: writing to {self._export_dir}")
         self._export_thread = threading.Thread(target=self._export_worker, daemon=True)
         self._export_thread.start()
         self._poll_export()
 
     def _export_worker(self):
-        from datetime import datetime
-
-        export_dir = os.path.normpath(
-            os.path.join(os.path.dirname(__file__), "..", "..", "exports")
-        )
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        run_dir = os.path.join(export_dir, f"chemical_id_{ts}")
-        os.makedirs(run_dir, exist_ok=True)
-        self._export_dir = run_dir
+        show_boxes, show_masks, show_labels, use_material_colors, use_chem_bg = self._export_options
 
         snapshot = list(self.processed_results)
         for i, item in enumerate(snapshot, start=1):
+            base_img = item["chem_map_bgr"] if use_chem_bg else item["image_bgr"]
             bgr = compose_image(
-                item["image_bgr"], item["masks"], item["materials"],
+                base_img, item["masks"], item["materials"],
                 item["boxes_xyxy"], item["confidences"],
-                show_yolo=True, show_sam2=True, show_labels=True, hover_idx=-1,
+                show_yolo=show_boxes,
+                show_sam2=show_masks,
+                show_labels=show_labels,
+                use_material_colors=use_material_colors,
+                hover_idx=-1,
             )
             pil = Image.fromarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
             base = os.path.splitext(item["filename"])[0]
-            pil.save(os.path.join(run_dir, f"{base}_chemical_id.png"), format="PNG")
+            pil.save(os.path.join(self._export_dir, f"{base}.png"), format="PNG")
             self._export_progress = (i, len(snapshot))
 
         self._export_done = True
 
     def _poll_export(self):
         done, total = self._export_progress
-        self.lbl_export.config(text=f"Export: {done}/{total} saved")
+        self.lbl_export.config(text=f"Export: {done}/{total} saved -> {self._export_dir}")
         if self._export_done:
             self.is_exporting = False
             self.btn_export.config(state=tk.NORMAL)
-            self.lbl_export.config(text=f"Exported {total} images to {self._export_dir}")
             return
         self.root.after(150, self._poll_export)
 

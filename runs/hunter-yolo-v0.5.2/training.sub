@@ -1,0 +1,37 @@
++WantFlocking = true
++WantGlideIn  = true
++JobMaxVacateTime = 1800
++DockerRunOptions = "--shm-size=8g"
+
+universe     = docker
+docker_image = ultralytics/ultralytics:8.4.40
+executable   = run_job.sh
+batch_name   = "lake_mendota_yolo"
+
+Requirements = (CUDAGlobalMemoryMb >= 24000)
+
+environment = "CLUSTER=$(Cluster)"
+
+transfer_input_files = run_job.sh, train_yolo.py, augment_data.py, ../datasets/MicroplasticsAggregate.v4-negativecropsincluded.yolov11.zip, checkpoint.pt
+
+should_transfer_files = YES
+when_to_transfer_output = ON_EXIT_OR_EVICT
+transfer_output_files = final_model.pt, checkpoint.pt
+transfer_output_remaps = "final_model.pt=/staging/pwang384/yolo_best_$(Cluster).pt; checkpoint.pt=/staging/pwang384/checkpoint_$(Cluster).pt"
+
+stream_output = True
+stream_error = True
+
+request_gpus   = 1
+request_cpus   = 4
+request_memory = 40GB
+request_disk   = 30GB
+
+output = latest_job.out
+error  = latest_job.err
+log    = latest_job.log
+
+# --- FIXED: Hold for real crashes, but ignore our graceful 143 eviction exit! ---
+on_exit_hold = (ExitCode != 0) && (ExitCode != 143)
+
+queue 1
